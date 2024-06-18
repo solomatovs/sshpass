@@ -1,0 +1,14 @@
+[package]
+name = "sshpass"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+duct = "0.13"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+nix = { version = "0.29.0", features = ["fs"] }
+rpassword = "7.3.1"
+clap = { version = "4.0", features = ["derive"] }
+env_logger = "0.11.3"
+termion = "4.0.2"
