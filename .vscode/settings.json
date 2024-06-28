@@ -1,0 +1,8 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "./Cargo.toml",
+    ],
+    "rust-analyzer.completion.autoimport.enable": true,
+    "rust-analyzer.cargo.allTargets": true,
+    "rust-analyzer.cargo.autoreload": true,
+}
