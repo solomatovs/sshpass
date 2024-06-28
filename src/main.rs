@@ -5,10 +5,18 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::env;
 
+use std::os::fd::AsRawFd;
+
 use tokio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
 use tokio::process::Child;
+
+use termios::Termios;
+use termios::{
+    tcsetattr, BRKINT, CS8, CSIZE, ECHO, ECHONL, ICANON, ICRNL, IEXTEN, IGNBRK, IGNCR, INLCR, ISIG,
+    ISTRIP, IXON, OPOST, PARENB, PARMRK, TCSANOW, VMIN, VTIME,
+};
 
 #[derive(Debug)]
 pub struct Pty {
@@ -51,6 +59,24 @@ impl From<tokio::task::JoinError> for CliError {
     fn from(error: tokio::task::JoinError) -> Self {
         CliError::JoinError(error)
     }
+}
+
+fn set_keypress_mode(termios: &mut Termios) {
+    termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    termios.c_oflag &= !OPOST;
+    termios.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    termios.c_cflag &= !(CSIZE | PARENB);
+    termios.c_cflag |= CS8;
+    termios.c_cc[VMIN] = 0;
+    termios.c_cc[VTIME] = 0;
+}
+
+fn set_termios(stdin_fild: i32, termios: &Termios) -> std::io::Result<()> {
+    Ok(tcsetattr(stdin_fild, TCSANOW, &termios)?)
+}
+
+fn get_termios(stdin_fild: i32) -> std::io::Result<Termios> {
+    Termios::from_fd(stdin_fild)
 }
 
 fn create_pty(programm: &str, args: Vec<String>) -> Pty {
@@ -99,8 +125,18 @@ async fn main() -> Result<(), CliError> {
     let mut ptyout_buf: [u8; 1024] = [0; 1024];
     let mut stdin_buf: [u8; 1024] = [0; 1024];
 
-    let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
+
+    let mut stdin = tokio::io::stdin();
+    let mut termios = get_termios(stdin.as_raw_fd())?;
+    let c_lflag = termios.c_lflag;
+    let c_iflag = termios.c_iflag;
+    let c_oflag = termios.c_oflag;
+    let c_cflag = termios.c_cflag;
+    let c_cc = termios.c_cc;
+
+    set_keypress_mode(&mut termios);
+    set_termios(stdin.as_raw_fd(), &termios)?;
 
     let mut sigint =tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("Failed to create SIGINT handler");
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to create SIGTERM handler");
@@ -174,6 +210,16 @@ async fn main() -> Result<(), CliError> {
             },
         }
     };
+
+    termios.c_lflag = c_lflag;
+    termios.c_iflag = c_iflag;
+    termios.c_oflag = c_oflag;
+    termios.c_cflag = c_cflag;
+    termios.c_cc = c_cc;
+
+    set_termios(stdin.as_raw_fd(), &mut termios)?;
+    let termios = get_termios(stdin.as_raw_fd())?;
+    println!("current termios\n{:#?}", termios);
 
     status
 }
