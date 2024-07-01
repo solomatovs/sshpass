@@ -20,7 +20,7 @@
                 }
             },
             "args": [
-                "/usr/bin/ssh",
+                "ssh",
                 "ubuntu_1"
             ],
             "cwd": "${workspaceFolder}"
