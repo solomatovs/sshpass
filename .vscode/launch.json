@@ -21,7 +21,7 @@
             },
             "args": [
                 "ssh",
-                "ubuntu_1"
+                "ubuntu_2"
             ],
             "cwd": "${workspaceFolder}"
         },
