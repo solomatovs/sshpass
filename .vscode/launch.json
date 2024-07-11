@@ -21,8 +21,24 @@
             },
             "args": [
                 "ssh",
-                "ubuntu_2"
+                "ubuntu_1"
             ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "t2",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--example=t2",
+                ],
+                "filter": {
+                    "name": "t2",
+                    "kind": "example"
+                }
+            },
             "cwd": "${workspaceFolder}"
         },
     ]

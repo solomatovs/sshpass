@@ -1,0 +1,38 @@
+use std::io;
+
+use mio::{Poll, Events, Interest, Token};
+use mio_signals::{Signals, Signal, SignalSet};
+
+const SIGNAL: Token = Token(10);
+
+fn main() -> io::Result<()> {
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(128);
+
+    // Create a `Signals` instance that will catch signals for us.
+    let mut signals = Signals::new(SignalSet::all())?;
+    // And register it with our `Poll` instance.
+    poll.registry().register(&mut signals, SIGNAL, Interest::READABLE)?;
+
+    loop {
+        poll.poll(&mut events, None)?;
+
+        for event in events.iter() {
+            match event.token() {
+                // Because we're using edge triggers (default in Mio) we need
+                // to keep calling `receive` until it returns `Ok(None)`.
+                SIGNAL => loop {
+                    match signals.receive()? {
+                        Some(Signal::Interrupt) => println!("Got interrupt signal"),
+                        Some(Signal::Terminate) => println!("Got terminate signal"),
+                        Some(Signal::Quit) => println!("Got quit signal"),
+                        Some(Signal::User1) => println!("Got user signal 1"),
+                        Some(Signal::User2) => println!("Got user signal 2"),
+                        None => break,
+                    }
+                },
+                _ => println!("Got unexpected event: {:?}", event),
+            }
+        }
+    }
+}

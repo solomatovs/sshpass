@@ -1,46 +1,36 @@
-use nix::pty::openpty;
-use nix::sys::signalfd;
-use nix::unistd::Pid;
-use tokio::sync::mpsc::error::SendError;
+use std::env;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
-use std::fs::File;
-use std::io::{Read, StderrLock, StdinLock, StdoutLock, Write};
-use std::os::fd::{OwnedFd};
-use std::env;
-use nix::unistd::{fork, ForkResult, dup2};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::sys::signal::{kill, signal, sigprocmask, SigSet, SIGINT, SIGTERM};
-use nix::libc::{ioctl, F_SETFL, O_NONBLOCK, signalfd, sigset_t, sigemptyset, sigaddset};
-// use std::os::fd::AsRawFd;
-
-use tokio;
-use tokio::sync::mpsc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command as TokioCommand;
-use tokio::process::Child;
-// use tokio::signal;
-use nix::sys::signalfd::SfdFlags;
-
-
+use std::io::Write;
 use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
-use nix::{poll::{PollTimeout, PollFd, PollFlags, poll},
-unistd::{pipe, read}
-};
+use std::time::Duration;
 
+use nix::libc::ioctl;
+use nix::sys::signal::{kill, SigSet, Signal};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+
+use nix::unistd::{fork, ForkResult};
+use nix::pty::openpty;
+use nix::{
+    poll::{poll, PollFd, PollFlags, PollTimeout},
+    unistd::{read, write},
+    libc::dup,
+};
+use log::{error, trace};
 
 use termios::Termios;
 use termios::{
-    tcsetattr, BRKINT, CS8, CSIZE, ECHO, ECHONL, ICANON, ICRNL, IEXTEN, IGNBRK, IGNCR, INLCR, ISIG,
-    ISTRIP, IXON, OPOST, PARENB, PARMRK, TCSANOW, VMIN, VTIME,
+    tcsetattr, BRKINT, CS8, CSIZE, ECHO, ECHONL, ICANON, ICRNL, IEXTEN, IGNBRK, IGNCR, INLCR, ISIG, IGNPAR,
+    ISTRIP, IXON, OPOST, PARENB, PARMRK, TCSANOW, VMIN, VTIME, IXANY, IXOFF, ECHOE, ECHOK,
 };
 
+use clap::{Arg, ArgAction, Command};
 
-#[derive(Debug)]
-pub struct Pty {
-    pub process: Child,
-    fd: OwnedFd,
-}
+// #[derive(Debug)]
+// pub struct Pty {
+//     pub process: Child,
+//     fd: OwnedFd,
+// }
 
 #[derive(Debug)]
 pub enum CliError {
@@ -52,15 +42,13 @@ pub enum CliError {
 
     ExitCodeError(i32),
 
-    JoinError(tokio::task::JoinError),
-
+    // JoinError(tokio::task::JoinError),
     Ok,
 
     ShutdownSendError,
 
     ChildTerminatedBySignal,
 }
-
 
 impl From<std::io::Error> for CliError {
     fn from(error: std::io::Error) -> Self {
@@ -79,28 +67,37 @@ impl From<i32> for CliError {
         CliError::ExitCodeError(error)
     }
 }
-impl From<tokio::task::JoinError> for CliError {
-    fn from(error: tokio::task::JoinError) -> Self {
-        CliError::JoinError(error)
-    }
-}
 
+// Флаг          Значение
+// ISIG          Разрешить посылку сигналов
+// ICANON        Канонический ввод (обработка забоя и стирания строки)
+// XCASE         Каноническое представление верхнего/нижнего регистров
+// ECHO          Разрешить эхо
+// ECHOE         Эхо на символ забоя - BS-SP-BS
+// ECHOK         Выдавать NL после символа стирания строки
+// ECHONL        Выдавать эхо на NL
+// NOFLSH        Запретить сброс буферов после сигналов прерывания и
+//               завершения
+// TOSTOP        Посылать SIGTTOU фоновым процессам, которые пытаются
+//               выводить на терминал
+// ECHOCTL       Выдавать эхо на CTRL-символы как .r, ASCII DEL как
+//               ?
+// ECHOPRT       Эхо на символ забоя как стертый символ
+// ECHOKE        При стирании строки, очищать ранее введенную строку
+//               символами BS-SP-BS
+// FLUSHO        Сбрасывание буфера вывода (состояние)
+// PENDIN        Повторять несчитанный ввод при следующем чтении или
+//               введенном символе
+// IEXTEN        Разрешить расширенные (определенные реализацией)
+//               функции
 fn set_keypress_mode(termios: &mut Termios) {
-    // termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    // termios.c_oflag &= !OPOST;
+    termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL |IXON);
+    termios.c_oflag &= !OPOST;
     termios.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    // termios.c_cflag &= !(CSIZE | PARENB);
-    // termios.c_cflag |= CS8;
+    termios.c_cflag &= !(CSIZE | PARENB);
+    termios.c_cflag |= CS8;
     termios.c_cc[VMIN] = 0;
     termios.c_cc[VTIME] = 0;
-
-    // termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    // termios.c_oflag &= !OPOST;
-    // termios.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    // termios.c_cflag &= !(CSIZE | PARENB);
-    // termios.c_cflag |= CS8;
-    // termios.c_cc[VMIN] = 1;
-    // termios.c_cc[VTIME] = 0;
 }
 
 fn set_termios(stdin_fild: i32, termios: &Termios) -> std::io::Result<()> {
@@ -111,147 +108,65 @@ fn get_termios(stdin_fild: i32) -> std::io::Result<Termios> {
     Termios::from_fd(stdin_fild)
 }
 
-fn create_pty(programm: &str, args: Vec<String>) -> Pty {
-    let ends = openpty(None, None).expect("openpty failed");
-    let master = ends.master;
-    let slave = ends.slave;
+fn run() -> Result<(), CliError> {
+    // выставляем логирование
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Trace)
+        .parse_default_env()
+        .try_init();
 
-    let mut cmd = TokioCommand::new(programm);
-    let cmd = cmd.args(args);
-
-    let new_follower_stdio = || unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) };
-    cmd.stdin(new_follower_stdio());
-    cmd.stdout(new_follower_stdio());
-    cmd.stderr(new_follower_stdio());
-
-    match cmd.spawn() {
-        Ok(process) => {
-            let pty = Pty {
-                process,
-                fd: master,
-            };
-
-            pty
-        }
-        Err(e) => {
-            panic!("Failed to create pty: {}", e);
-        }
-    }
-}
-
-pub fn waitpio(child: Pid) -> Result<bool, CliError> {
-    // eprintln!("{:?}: {:?}: waitpid before", std::thread::current().id(), std::time::SystemTime::now());
-    match waitpid(child, None) {
-        Err(nix::errno::Errno::ECHILD) => {
-            // eprintln!("{:?}: {:?}: waitpid error: {:#?}", std::thread::current().id(), std::time::SystemTime::now(), nix::errno::Errno::ECHILD);
-            return Ok(true);
-        }
-        Err(nix::errno::Errno::EINTR) => {
-            // eprintln!("{:?}: {:?}: waitpid error: {:#?}", std::thread::current().id(), std::time::SystemTime::now(), nix::errno::Errno::EINTR);
-            return Ok(false);
-        }
-        Err(e) => {
-            // eprintln!("{:?}: {:?}: waitpid error: {:#?}", std::thread::current().id(), std::time::SystemTime::now(), e);
-            return Err(e.into());
-        }
-        Ok(WaitStatus::Exited(_pid, status)) => {
-            // eprintln!("{:?}: {:?}: WaitStatus::Exited(pid: {:?}, status: {:?}", std::thread::current().id(), std::time::SystemTime::now(), _pid, status);
-            if status != 0 {
-                return Err(CliError::ExitCodeError(status));
-            } else {
-                return Ok(true);
-            }
-        }
-        Ok(WaitStatus::Signaled(pid, sig, _dumped)) => {
-            // eprintln!("{:?}: {:?}: WaitStatus::Signaled(pid: {:?}, sig: {:?}, dumped: {:?})", std::thread::current().id(), std::time::SystemTime::now(), pid, sig, _dumped);
-            return  Ok(false);
-        }
-        Ok(WaitStatus::Stopped(pid, sig)) => {
-            // eprintln!("{:?}: {:?}: WaitStatus::Stopped(pid: {:?}, sig: {:?})", std::thread::current().id(), std::time::SystemTime::now(), pid, sig);
-            return Ok(false)
-        }
-        Ok(WaitStatus::StillAlive) => {
-            // eprintln!("{:?}: {:?}: WaitStatus::StillAlive", std::thread::current().id(), std::time::SystemTime::now());
-            return Ok(false)
-        }
-        Ok(WaitStatus::Continued(pid)) => {
-            // eprintln!("{:?}: {:?}: WaitStatus::Continued(pid: {:?})", std::thread::current().id(), std::time::SystemTime::now(), pid);
-            return Ok(false)
-        }
-        Ok(WaitStatus::PtraceEvent(pid, sig, c)) => {
-            // eprintln!("{:?}: {:?}: WaitStatus::PtraceEvent(pid: {:?}, sig: {:?}, c: {:?})", std::thread::current().id(), std::time::SystemTime::now(), pid, sig, c);
-            return Ok(false)
-        }
-        Ok(WaitStatus::PtraceSyscall(pid)) => {
-            // eprintln!("{:?}: {:?}: WaitStatus::PtraceSyscall(pid: {:?})", std::thread::current().id(), std::time::SystemTime::now(), pid);
-            return Ok(false)
-        }
-    }
-}
-
-// use nix::sys::signal;
-// use std::sync::atomic::{AtomicBool, Ordering};
-
-// static RUNNING: AtomicBool = AtomicBool::new(false);
-
-// extern "C" fn handle(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
-//     RUNNING.store(false, Ordering::SeqCst);
-// }
-
-// fn install_signal_handler() -> bool {
-//     let mut sigset = SigSet::empty();
-//     sigset.add(SIGINT);
-//     sigset.add(SIGTERM);
-
-//     let res = nix::sys::signal::sigprocmask(nix::sys::signal::SigmaskHow::SIG_SETMASK, Some(&sigset), None);
-//     if let Err(e) = res {
-//         eprintln!("{:#?}", e);
-//         return false;
-//     }
-
-//     nix::sys::signalfd::SignalFd()
-//     // int signal_fd = signalfd(-1, &mask, SFD_NONBLOCK);
-//     // int signal_fd = signalfd(-1, &mask, SFD_NONBLOCK);
-    
-//     todo!();
-// }
-
-// #[tokio::main]
-fn main() -> Result<(), CliError> {
-    // if ! install_signal_handler() {
-    //     std::process::exit(1);
-    // }
-
-    // RUNNING.store(true, Ordering::SeqCst);
-
+    // парсим аргументы
     let mut cmd: Vec<String> = env::args().collect();
     if cmd.len() < 2 {
-        eprintln!("Usage: {} <command> [args...]", cmd[0]);
-        std::process::exit(1);
+        error!("Usage: {} <command> [args...]", cmd[0]);
+        return Err(CliError::ArgumentError(cmd[0].to_owned()));
     }
 
     // Создаем псевдотерминал (PTY)
     let pty = openpty(None, None).expect("Failed to open PTY");
     let slave = pty.slave;
+    let master = pty.master.try_clone().expect("try_clone pty.master");
+
+    // let stdin = std::io::stdin();    
+    // let termios = get_termios(stdin.as_raw_fd())?;
+    // trace!("{:#?}", termios);
+    // let c_lflag = termios.c_lflag;
+    // let c_iflag = termios.c_iflag;
+    // let c_oflag = termios.c_oflag;
+    // let c_cflag = termios.c_cflag;
+    // let c_cc = termios.c_cc;
+    // // // эта програма исполняется только в родительском процессе
+    // let stdin = std::io::stdin().lock();
+    // let mut termios = get_termios(stdin.as_raw_fd())?;
+    // set_keypress_mode(&mut termios);
+    // set_termios(stdin.as_raw_fd(), &termios)?;
 
     let status = match unsafe { fork() } {
         Ok(ForkResult::Child) => {
+            // let stdin = std::io::stdin();
+            // let mut termios = get_termios(stdin.as_raw_fd())?;
+            // trace!("{:#?}", termios);
+            // let c_lflag = termios.c_lflag;
+            // let c_iflag = termios.c_iflag;
+            // let c_oflag = termios.c_oflag;
+            // let c_cflag = termios.c_cflag;
+            // let c_cc = termios.c_cc;
+            // эта програма исполняется только в родительском процессе
+            // let stdin = std::io::stdin().lock();
+            // let mut termios = get_termios(stdin.as_raw_fd())?;
+            // set_keypress_mode(&mut termios);
+            // set_termios(stdin.as_raw_fd(), &termios)?;
+			unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCNOTTY) };
+			unsafe { nix::libc::setsid() };
+			unsafe { nix::libc::ioctl(slave.as_raw_fd(), nix::libc::TIOCSCTTY) };
             // эта программа исполняется только в дочернем процессе
             // родительский процесс в это же время выполняется и что то делает
-
-            // Подключаем slave конец псевдотерминала к стандартным потокам ввода/вывода            
-            // dup2(slave.as_raw_fd(), libc::STDIN_FILENO.as_raw_fd()).expect("Failed to dup2 stdin");
-            // dup2(slave.as_raw_fd(), libc::STDOUT_FILENO.as_raw_fd()).expect("Failed to dup2 stdout");
-            // dup2(slave.as_raw_fd(), libc::STDERR_FILENO.as_raw_fd()).expect("Failed to dup2 stderr");
-            eprintln!("sdfsdfsdfsdfsdf");
             cmd.remove(0);
             let program = cmd.remove(0);
             let args = cmd;
-        
+
             // lambda функция для перенаправления stdio
-            let new_follower_stdio = || unsafe {
-                Stdio::from_raw_fd(slave.as_raw_fd())
-            };
+            let new_follower_stdio = || unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) };
 
             // ДАЛЬНЕЙШИЙ ЗАПУСК БЕЗ FORK ПРОЦЕССА
             // это означает что дочерний процесс не будет еще раз разделятся
@@ -263,279 +178,242 @@ fn main() -> Result<(), CliError> {
                 .stdout(new_follower_stdio())
                 .stderr(new_follower_stdio())
                 .exec()
-            ;
+                // .spawn()
+                ;
+
+            // return err?;
+
+            // err.map_err(|e| e.into())
 
             // Err(err.into())
             Ok(())
         }
-        Ok(ForkResult::Parent { child }) => {
-            // эта програма исполняется только в родительском процессе
-            // дочерний процесс в это же время работает и что то делает
-
-            // создаем дескриптов для чтения/записи из/в дочерний процесс
-            // let mut ptyout = unsafe { tokio::fs::File::from_raw_fd(pty.master.as_raw_fd()) };
-            // let mut ptyinout = unsafe { tokio::fs::File::from_raw_fd(pty.master.as_raw_fd()) };
-            // if unsafe { libc::fcntl(pty.master.as_raw_fd(), libc::F_SETFL, O_NONBLOCK) } == -1 {
-            //     return Err(std::io::Error::last_os_error().into());
-            // }
-
-            
-            // let mut stdin = stdin.lock();
-
-            // if unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, O_NONBLOCK) } == -1 {
-            //     return Err(std::io::Error::last_os_error().into());
-            // }
-            
-            // let mut ptyout = unsafe { tokio::fs::File::from_raw_fd(pty.master.as_raw_fd()) };
-
-            // канал в котором появится сигнал о завершении работы
-            // let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-
-            // обработка сигналов заверешния раоты через CTRL+C
-            // let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("Failed to create SIGINT handler");
-            // let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to create SIGTERM handler");
-
-            // let stdin = tokio::io::stdin();
-            // let stdin_fd = stdin.as_raw_fd();
-            // let mut stdin = stdin.take(1024);
-            let mut stdin = std::io::stdin();
-            let stdin_fd = stdin.as_raw_fd();
-            let mut stdin = stdin.take(1024);
-            let mut termios = get_termios(stdin_fd)?;
+        Ok(ForkResult::Parent { child }) => {      
+            let stdin = std::io::stdin();    
+            let termios = get_termios(stdin.as_raw_fd())?;
+            trace!("{:#?}", termios);
             let c_lflag = termios.c_lflag;
             let c_iflag = termios.c_iflag;
             let c_oflag = termios.c_oflag;
             let c_cflag = termios.c_cflag;
             let c_cc = termios.c_cc;
+            // // эта програма исполняется только в родительском процессе
+            let stdin = std::io::stdin().lock();
+            let mut termios = get_termios(stdin.as_raw_fd())?;
             set_keypress_mode(&mut termios);
-            set_termios(stdin_fd, &termios)?;
-
-            // let mut stdin_fd = stdin.take(1024);
-
-            // Создаем буферы для чтения и записи в родительском процессе
-            // let mut stdout = tokio::io::stdout();
-            // let mut stderr = tokio::io::stderr();
-        
+            set_termios(stdin.as_raw_fd(), &termios)?;
+      
+            // регистрирую сигналы ОС для обработки в приложении
             let mut mask = SigSet::empty();
             mask.add(nix::sys::signal::SIGINT);
             mask.add(nix::sys::signal::SIGTERM);
-            // sigprocmask(nix::sys::signal::SigmaskHow::SIG_SETMASK, Some(&mask), None).expect("sigprocmask");
-            // mask.thread_set_mask().expect("sigprocmask");
-            
-            
-            // unsafe {
-            //     signalfd(-1, &mask.  as *const libc::sigset_t, nix::sys::signalfd::SfdFlags::SFD_NONBLOCK.bits())
-            // };
-            // mask.thread_unblock().unwrap();
-            
-            // Signals are queued up on the file descriptor
-            let mut sfd = nix::sys::signalfd::SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK).unwrap();
-            
+            mask.add(nix::sys::signal::SIGCHLD);
 
-            // let pollpty = unsafe { std::fs::File::from_raw_fd(pty.master.as_raw_fd()) };
-            // let polltdin = std::io::stdin();
+            trace!("mask.thread_block()");
+            mask.thread_block()
+                .expect("pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(self), None) error");
+
+            trace!("nix::sys::signalfd::SignalFd::new(&mask);");
+            let signal_fd = nix::sys::signalfd::SignalFd::new(&mask).expect("SignalFd error");
+
+            // набор файловых указателей, которые будут обработаны poll
             let mut fds = [
-                // PollFd::new(pollpty.as_fd(), PollFlags::POLLIN), 
-                // PollFd::new(polltdin.as_fd(), PollFlags::POLLIN), 
-                PollFd::new(sfd.as_fd(), PollFlags::POLLIN)
+                PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN),
+                PollFd::new(pty.master.as_fd(), PollFlags::POLLIN),
+                PollFd::new(stdin.as_fd(), PollFlags::POLLIN),
             ];
 
-            // let mut ptyinout = unsafe { std::fs::File::from_raw_fd(pty.master.as_raw_fd()) };
-            // if unsafe { libc::fcntl(pty.master.as_raw_fd(), libc::F_SETFL, O_NONBLOCK) } == -1 {
-            //     return Err(std::io::Error::last_os_error().into());
-            // }
-
-            // let mut stdin = std::io::stdin();
-            //  if unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, O_NONBLOCK) } == -1 {
-            //     return Err(std::io::Error::last_os_error().into());
-            // }
-
-            // let mut stdout = std::io::stdout().lock();
+            let mut stdout = std::io::stdout().lock();
             // Асинхронный обработчик
-            // let mut buf = [0; 1024];
+            let mut buf = [0; 1024];
 
-            let _status = loop {
-                // std::thread::sleep(std::time::Duration::from_secs(1));
+            let status = loop {
+                trace!("poll(&mut fds, PollTimeout::MAX)");
+                match poll(&mut fds, PollTimeout::MAX) {
+                    Err(e) => {
+                        // error poll calling
+                        trace!("poll(&mut fds, PollTimeout::MAX)");
+                        error!("poll calling error: {}", e);
+                        break Err(e.into());
+                    }
+                    Ok(0) => {
+                        // timeout
+                        trace!("poll timeout: Ok(0)");
+                    }
+                    Ok(n) => {
+                        // match n events
+                        trace!("poll match {} events", n);
+                    }
+                };
 
-                // eprintln!("{:?}: {:?}: tick", std::thread::current().id(), std::time::SystemTime::now());
-                // tokio::select! {
-                    // Чтение из стандартного ввода и запись в PTY
-                    // eprintln!("ptyinout.read: before");
-                    // let (r, w) = pipe().unwrap();
-                    // eprintln!("poll before");
-                    let res = poll(&mut fds, PollTimeout::MAX);
-                    // eprintln!("poll alter: res {:#?}", res);
-                    let _res = match res {
-                        Ok(-1) => {
-                            eprintln!("poll Ok(-1)");
-                            continue;
+                trace!("check child process {} is running...", child);
+                match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                    Err(nix::errno::Errno::ECHILD) => {
+                        trace!(
+                            "the process {} is not a child of the process: {:?}",
+                            child,
+                            std::thread::current().id()
+                        );
+                        break Ok(());
+                    }
+                    Err(nix::errno::Errno::EINTR) => {
+                        trace!("waitpid error: {}", nix::errno::Errno::EINTR);
+                        break Err(CliError::NixErrorno(nix::errno::Errno::EINTR));
+                    }
+                    Err(e) => {
+                        trace!("waitpid error: {}", e);
+                        break Err(e.into());
+                    }
+                    Ok(WaitStatus::Exited(pid, status)) => {
+                        trace!("WaitStatus::Exited(pid: {:?}, status: {:?}", pid, status);
+                        if status != 0 {
+                            break Err(CliError::ExitCodeError(status));
+                        } else {
+                            break Ok(());
                         }
-                        Ok(0) => {
-                            eprintln!("poll Ok(0)");
-                            continue;
-                        }
-                        Ok(n) => {
-                            eprintln!("poll Ok({})", n);
-                            n
-                        }
-                        Err(e) => {
-                            eprintln!("poll Err({:#?})", e);
-                            continue;
-                        }
-                    };
-                    
-                    match sfd.read_signal() {
-                        // we caught a signal
+                    }
+                    Ok(WaitStatus::Signaled(pid, sig, _dumped)) => {
+                        trace!(
+                            "WaitStatus::Signaled(pid: {:?}, sig: {:?}, dumped: {:?})",
+                            pid,
+                            sig,
+                            _dumped
+                        );
+                    }
+                    Ok(WaitStatus::Stopped(pid, sig)) => {
+                        trace!("WaitStatus::Stopped(pid: {:?}, sig: {:?})", pid, sig);
+                    }
+                    Ok(WaitStatus::StillAlive) => {
+                        trace!("WaitStatus::StillAlive");
+                    }
+                    Ok(WaitStatus::Continued(pid)) => {
+                        trace!("WaitStatus::Continued(pid: {:?})", pid);
+                    }
+                    Ok(WaitStatus::PtraceEvent(pid, sig, c)) => {
+                        trace!(
+                            "WaitStatus::PtraceEvent(pid: {:?}, sig: {:?}, c: {:?})",
+                            pid,
+                            sig,
+                            c
+                        );
+                    }
+                    Ok(WaitStatus::PtraceSyscall(pid)) => {
+                        trace!("WaitStatus::PtraceSyscall(pid: {:?})", pid);
+                    }
+                }
+
+                trace!("check OS signal event...");
+                if let Some(nix::poll::PollFlags::POLLIN) = fds[0].revents() {
+                    trace!("match OS signal");
+                    match signal_fd.read_signal() {
                         Ok(Some(sig)) => {
-                            eprintln!("sfd.read_signal(Some({:#?}))", sig);
-                        }
-                        Ok(None) => {
-                            // there were no signals waiting (only happens when the SFD_NONBLOCK flag is set,
-                            // otherwise the read_signal call blocks)
-                            eprintln!("sfd.read_signal(Ok(None))");
+                            trace!("Some(res) = read_signal()");
+
+                            match Signal::try_from(sig.ssi_signo as i32) {
+                                Ok(sig) if sig == Signal::SIGINT || sig == Signal::SIGTERM => {
+                                    trace!("recv {sig}");
+                                    trace!("kill({child}, {sig}");
+                                    if let Err(nix::errno::Errno::ESRCH) = kill(child, Signal::SIGINT)
+                                    {
+                                        error!("pid {child} doesnt exists or zombie");
+                                    }
+                                }
+                                Ok(Signal::SIGCHLD) => {
+                                    // проверяем завершение дочернего процесса
+                                    trace!("recv SIGCHLD");
+                                }
+                                Ok(sig) => {
+                                    trace!(
+                                        "recv signal {}", sig
+                                    );
+                                }
+                                Err(e) => {
+                                    trace!("recv unknown signal");
+                                    error!("{e}");
+                                }
+                            }
                         }
                         Err(nix::errno::Errno::EAGAIN) => {
-                            eprintln!("sfd.read_signal(Err(nix::errno::Errno::EAGAIN))");
+                            trace!("Err(nix::errno::Errno::EAGAIN) = read_signal(), SFD_NONBLOCK flag is set");
+                        }
+                        Ok(None) => {
+                            trace!("Ok(None) = read_signal(), SFD_NONBLOCK flag is set possible");
                         }
                         Err(e) => {
-                            eprintln!("sfd.read_signal(Err({:#?}))", e);
-                        }, // some error happend
+                            trace!("Err(e) = read_signal()");
+                            error!("{}", e);
+                        }
                     }
-    
-                    // let r = read(ptyinout.as_raw_fd(), &mut buf[..]);
-                    // match r {
-                    //     Ok(0) => {
-                    //         // eprintln!("ptyinout.read: Ok(0)");
-                    //     }, // EOF
-                    //     Ok(n) => {
-                    //         if let Err(e) = stdout.write_all(&buf[..n]) {
-                    //             // eprintln!("stdout.write_all: {:#?}", e);
-                    //         } else {
-                    //             // eprintln!("stdout.writed: {}", String::from_utf8_lossy(&buf[..n]));
-                    //         }
-                    //     }
-                    //     Err(nix::errno::Errno::EAGAIN) => {
-                            
-                    //     }
-                    //     Err(e) => {
-                    //         // eprintln!("ptyinout.read: {:#?}", e);
-                    //     }
-                    // }
+                }
 
-                    
-                    // let r = read(stdin.as_raw_fd(), &mut buf[..]);
-                    // match r {
-                    //     Ok(0) => {
-                    //         // eprintln!("stdin.read: Ok(0)");
-                    //     }, // EOF
-                    //     Ok(n) => {
-                    //         if let Err(e) = ptyinout.write_all(&buf[..n]) {
-                    //             // eprintln!("ptyinout.write_all: {:#?}", e);
-                    //         } else {
-                    //             // eprintln!("ptyinout.writed: {}", String::from_utf8_lossy(&buf[..n]));
-                    //         }
-                    //     }
-                    //     Err(nix::errno::Errno::EAGAIN) => {
+                trace!("check pty events...");
+                if let Some(nix::poll::PollFlags::POLLIN) = fds[1].revents() {
+                    trace!("match pty event");
+                    trace!("read(pty.master.as_raw_fd(), &mut buf[..])");
 
-                    //     }
-                    //     Err(e) => {
-                    //         // eprintln!("stdin.read: {:#?}", e);
-                    //     }
-                    // }
+                    match read(pty.master.as_raw_fd(), &mut buf) {
+                        Err(nix::errno::Errno::EAGAIN) => {
+                            // SFD_NONBLOCK mode is set
+                            trace!("Err(nix::errno::Errno::EAGAIN) = read(pty.master), SFD_NONBLOCK flag is set");
+                        }
+                        Err(e) => {
+                            // error
+                            trace!("Err(e) = read(pty.master)");
+                            error!("pty.master read error");
+                            error!("{}", e);
+                        }
+                        Ok(0) => {
+                            // EOF
+                            trace!("Ok(0) = read(pty.master)");
+                        }
+                        Ok(n) => {
+                            // read n bytes
+                            trace!("Ok({n}) = read(pty.master)");
+                            trace!("utf8: {}", String::from_utf8_lossy(&buf[..n]));
+                            if let Err(e) = stdout.write_all(&buf[..n]) {
+                                trace!("Err(e) = stdout.write_all(&buf[..n])");
+                                error!("stdout write error");
+                                error!("{e}");
+                            }
+                            if let Err(e) = stdout.flush() {
+                                trace!("Err(e) = stdout.write_all(&buf[..n])");
+                                error!("stdout write error");
+                                error!("{e}");
+                            }
+                        }
+                    }
+                }
 
-                    // let r = ptyinout.read(&mut buf);
-                    // match r {
-                    //     Ok(0) => {
-                    //         eprintln!("ptyinout.read: Ok(0)");
-                    //     }, // EOF
-                    //     Ok(n) => {
-                    //         if let Err(e) = stdout.write_all(&buf[..n]) {
-                    //             eprintln!("stdout.write_all: {:#?}", e);
-                    //         } else {
-                    //             eprintln!("stdout.writed: {}", String::from_utf8_lossy(&buf[..n]));
-                    //         }
-                    //     }
-                    //     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    //         // eprintln!("pty read blocked {:#?}", e);
-                    //     }
-                    //     Err(e) => {
-                    //         eprintln!("ptyinout.read: {:#?}", e);
-                    //     }
-                    // }
+                trace!("check stdin events...");
+                if let Some(nix::poll::PollFlags::POLLIN) = fds[2].revents() {
+                    trace!("read(stdin)");
 
-                    // // std::thread::sleep(std::time::Duration::from_secs(3));
-                    // // // Чтение из PTY и запись в стандартный вывод
-                    // let r = stdin.read(&mut buf);
-                    // match r {
-                    //     Ok(0) => {
-                    //         eprintln!("stdin.read: Ok(0)");
-                    //     }, // EOF
-                    //     Ok(n) => {
-                    //         let res = ptyinout.write_all(&buf[..n]);
-                    //         if let Err(e) = res{
-                    //             eprintln!("ptyinout.write_all: {:#?}", e);
-                    //         } else {
-                    //             eprintln!("ptyinout.writed: {}", String::from_utf8_lossy(&buf[..n]));
-                    //         }
-                    //     }
-                    //     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    //         // eprintln!("stdin read blocked {:#?}", e);
-                    //     }
-                    //     Err(e) => {
-                    //         eprintln!("stdin.read: {:#?}", e);
-                    //     }
-                    // }
-
-                    
-                    
-                    // Обработка сигналов завершения
-                    // _ = sigint.recv() => {
-                    //     eprintln!("{:?}: {:?}: Received SIGINT, terminating child process...", std::thread::current().id(), std::time::SystemTime::now());
-                        
-                    //     let res = kill(child, SIGINT);
-                    //     match res {
-                    //         Ok(_) | Err(nix::errno::Errno::ESRCH) => {},
-                    //         Err(e) => {
-                    //             // eprintln!("{:?}: {:?}: kill(child, SIGINT): {:#?}", std::thread::current().id(), std::time::SystemTime::now(), e);
-                    //         },
-                    //     }
-                    // },
-                    // _ = sigterm.recv() => {
-                    //     // eprintln!("{:?}: {:?}: Received SIGTERM, terminating child process...", std::thread::current().id(), std::time::SystemTime::now());
-                    //     let res = kill(child, SIGTERM);
-                    //     match res {
-                    //         Ok(_) | Err(nix::errno::Errno::ESRCH) => {},
-                    //         Err(e) => {
-                    //             // eprintln!("{:?}: {:?}: kill(child, SIGTERM): {:#?}", std::thread::current().id(), std::time::SystemTime::now(), e);
-                    //         },
-                    //     }
-                    // },
-                    // res = tokio::task::spawn_blocking(move || waitpio(child)) => match res {
-                    //     Err(e) => {
-                    //         // if let Err(_) = shutdown_tx.send(Err(e.into())).await {
-                    //         // eprintln!("{:?}: {:?}: spawn_blocking(move || waitpio: {:#?}", std::thread::current().id(), std::time::SystemTime::now(), e);
-                    //         break Err(CliError::ShutdownSendError);
-                    //         // }
-                    //     }
-                    //     Ok(Err(e)) => {
-                    //         // if let Err(_) = shutdown_tx.send(Err(e.into())).await {
-                    //         // eprintln!("{:?}: {:?}: spawn_blocking(move || waitpio: {:#?}", std::thread::current().id(), std::time::SystemTime::now(), e);
-                    //         break Err(CliError::ShutdownSendError);
-                    //         // }
-                    //     }
-                    //     Ok(Ok(true)) => {
-                    //         // eprintln!("{:?}: {:?}: waitpio(child) = Ok(true)", std::thread::current().id(), std::time::SystemTime::now());
-                    //         break Ok(());
-                    //     }
-                    //     Ok(Ok(false)) => {
-                    //         // eprintln!("{:?}: {:?}: waitpio(child) = Ok(false)", std::thread::current().id(), std::time::SystemTime::now());
-                    //     }
-                    // },
-                    // _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    //     eprintln!("timer...");
-                    //     std::thread::sleep(std::time::Duration::from_secs(10));
-                    // }
-                // }
+                    match read(stdin.as_raw_fd(), &mut buf) {
+                        Err(nix::errno::Errno::EAGAIN) => {
+                            // SFD_NONBLOCK mode is set
+                            // trace!("Err(nix::errno::Errno::EAGAIN) = read(stdin), SFD_NONBLOCK flag is set");
+                        }
+                        Err(e) => {
+                            // error
+                            trace!("Err(e) = read(stdin)");
+                            error!("stdin read error");
+                            error!("{}", e);
+                        }
+                        Ok(0) => {
+                            // EOF
+                            trace!("Ok(0) = read(stdin)");
+                        }
+                        Ok(n) => {
+                            trace!("Ok({n}) = read(stdin)");
+                            trace!("utf8: {}", String::from_utf8_lossy(&buf[..n]));
+                            if let Err(e) = write(pty.master.as_fd(), &buf[..n]) {
+                                trace!("write(pty.master.as_fd()");
+                                error!("error writing to pty");
+                                error!("{e}");
+                            }
+                        }
+                    }
+                }
             };
 
             // Восстанавливаем исходные атрибуты терминала
@@ -545,131 +423,154 @@ fn main() -> Result<(), CliError> {
             termios.c_cflag = c_cflag;
             termios.c_cc = c_cc;
 
-            set_termios(stdin_fd, &mut termios)?;
+            set_termios(stdin.as_raw_fd(), &mut termios)?;
+            let termios = get_termios(stdin.as_raw_fd());
+            trace!("{:#?}", termios);
 
-            _status
+            status
         }
         Err(e) => {
-            eprintln!("{:?}: {:?}: Fork failed: {}", std::thread::current().id(), std::time::SystemTime::now(), e);
+            error!(
+                "{:?}: {:?}: Fork failed: {}",
+                std::thread::current().id(),
+                std::time::SystemTime::now(),
+                e
+            );
             Err(CliError::NixErrorno(e))
         }
     };
 
-    // Ok(())
-    // let mut pty = create_pty(&program, cmd);
-    // println!("{:#?}", pty);
-
-    // let mut ptyout = tokio::fs::File::from(File::from(pty.fd.try_clone().expect("fd clone failed")));
-    // // let mut ptyin = tokio::fs::File::from(File::from(pty.fd.try_clone().expect("fd clone failed")));
-
-    // let mut ptyout_buf: [u8; 1024] = [0; 1024];
-    // // let mut stdin_buf: [u8; 1024] = [0; 1024];
-
-    // let mut stdout = tokio::io::stdout();
-    // // let mut stdin = tokio::io::stdin();
-    // // let mut termios = get_termios(stdin.as_raw_fd())?;
-    // // let c_lflag = termios.c_lflag;
-    // // let c_iflag = termios.c_iflag;
-    // // let c_oflag = termios.c_oflag;
-    // // let c_cflag = termios.c_cflag;
-    // // let c_cc = termios.c_cc;
-
-    // // set_keypress_mode(&mut termios);
-    // // set_termios(stdin.as_raw_fd(), &termios)?;
-
-    // // let mut sigint =tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("Failed to create SIGINT handler");
-    // // let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to create SIGTERM handler");
-
-    // let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-    // let status = loop {
-    //     tokio::select! {
-    //         res = ptyout.read(ptyout_buf.as_mut()) => match res {
-    //             Ok(0) => {},
-    //             Ok(n) => {
-    //                 if let Err(e) = stdout.write_all(&ptyout_buf[..n]).await {
-    //                     eprintln!("stdout.write_all: {:#?}", e);
-    //                 }
-
-    //                 ptyout_buf.fill(0);
-    //             }
-    //             Err(e) => {
-    //                 eprintln!("ptyout.read: {:#?}", e);
-
-    //                 shutdown_tx.send(true).await.expect("shutdown send failed");
-    //             }
-    //         },
-    //         res = shutdown_rx.recv() => match res {
-    //             Some(_) => {
-    //                 break;
-    //             }
-    //             None => {
-
-    //             }
-    //         }
-    //         // res = stdin.read(stdin_buf.as_mut()) => match res {
-    //         //     Ok(0) => {},
-    //         //     Ok(n) => {
-    //         //         if let Err(e) = ptyin.write_all(&stdin_buf[..n]).await {
-    //         //             eprintln!("ptyin.write_all: {:#?}", e);
-    //         //         }
-    //         //         if let Err(e) = ptyin.flush().await {
-    //         //             eprintln!("ptyin.write_all: {:#?}", e);
-    //         //         }
-
-    //         //         stdin_buf.fill(0);
-    //         //     }
-    //         //     Err(e) => {
-    //         //         eprintln!("stdin.read: {:#?}", e);
-    //         //     }
-    //         // },
-    //         // _ = sigint.recv() => {
-    //         //     if let Some(id) = pty.process.id() {
-    //         //         let pid = Pid::from_raw(id.try_into().unwrap());
-    //         //         if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT) {
-    //         //             eprintln!("failed send SIGINT to pid: {}, error: {}", pid, e);
-    //         //         }
-    //         //     }
-    //         // },
-    //         // _ = sigterm.recv() => {
-    //         //     if let Some(id) = pty.process.id() {
-    //         //         let pid = Pid::from_raw(id.try_into().unwrap());
-    //         //         if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
-    //         //             eprintln!("failed send SIGTERM to pid: {}, error: {}", pid, e);
-    //         //         }
-    //         //     }
-    //         // },
-    //         // r = pty.process.wait() => match r {
-    //         //     Ok(s) => match s.code() {
-    //         //         None => {
-    //         //             println!("Process terminated by signal");
-    //         //             break Err(CliError::ExitCodeError(-1));
-    //         //         },
-    //         //         Some(0) => {
-    //         //             println!("Ok()");
-    //         //             break Ok(())
-    //         //         },
-    //         //         Some(s) => {
-    //         //             println!("{:#?}", s);
-    //         //             break Err(CliError::ExitCodeError(s))
-    //         //         },
-    //         //     }
-    //         //     Err(e) => {
-    //         //         println!("{:#?}", e);
-    //         //         break Err(CliError::StdIoError(e));
-    //         //     }
-    //         // },
-    //     }
-    // };
-
-    // termios.c_lflag = c_lflag;
-    // termios.c_iflag = c_iflag;
-    // termios.c_oflag = c_oflag;
-    // termios.c_cflag = c_cflag;
-    // termios.c_cc = c_cc;
-
-    // set_termios(stdin.as_raw_fd(), &mut termios)?;
-    // let termios = get_termios(stdin.as_raw_fd())?;
-    println!("buy\n");
-
     status
 }
+
+
+fn main() -> Result<(), CliError> {
+    let matches = Command::new("sshpass")
+        .version("1.0")
+        .about("Non-interactive ssh password provider")
+        .arg(Arg::new("user")
+            .required(true)
+            .help("The user to log in as"))
+        .arg(Arg::new("hostname")
+            .required(true)
+            .help("The hostname or IP address of the remote server"))
+        .arg(Arg::new("password")
+            .short('p')
+            .long("password")
+            .value_name("PASSWORD")
+            .help("Provide password as argument (security unwise)"))
+        .arg(Arg::new("file")
+            .short('f')
+            .long("file")
+            .value_name("FILENAME")
+            .help("Take password to use from file"))
+        .arg(Arg::new("fd")
+            .short('d')
+            .long("fd")
+            .value_name("FD")
+            
+            .help("Use number as file descriptor for getting password"))
+        .arg(Arg::new("env")
+            .short('e')
+            .long("env")
+            .action(ArgAction::SetTrue)
+            .help("Password is passed as env-var 'SSHPASS'"))
+        .arg(Arg::new("prompt")
+            .short('P')
+            .long("prompt")
+            .value_name("PROMPT")
+            .help("Which string should sshpass search for to detect a password prompt"))
+        .arg(Arg::new("verbose")
+            .short('v')
+            .long("verbose")
+            .action(ArgAction::SetTrue)
+            .help("Be verbose about what you're doing"))
+        .arg(Arg::new("help")
+            .short('h')
+            .long("help")
+            .action(ArgAction::Help)
+            .help("Show help (this screen)"))
+        .arg(Arg::new("version")
+            .short('V')
+            .long("version")
+            .action(ArgAction::Version)
+            .help("Print version information"))
+        .arg(Arg::new("otp")
+            .short('o')
+            .long("otp")
+            .value_name("OTP")
+            .help("One time password"))
+        .arg(Arg::new("command")
+            .short('c')
+            .long("command")
+            .value_name("COMMAND")
+            .help("Executable file name printing one time password"))
+        .arg(Arg::new("otp_prompt")
+            .short('O')
+            .long("otp-prompt")
+            .value_name("OTP_PROMPT")
+            .help("Which string should sshpass search for the one time password prompt"))
+        .get_matches();
+    
+    run()
+}
+
+
+fn _strip_nl(s: &mut String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    let out: String = s.to_string();
+    out
+}
+
+// // Функция для чтения пароля в зависимости от аргументов командной строки
+// fn _get_password(matches: &clap::ArgMatches) -> String {
+//     if let Some(&fd) = matches.get_one::<i32>("fd") {
+//         // Дублируем файловый дескриптор и читаем пароль
+//         let fd_dup = dup(fd).expect("Failed to duplicate file descriptor");
+//         let mut fd_file = unsafe { File::from_raw_fd(fd_dup) };
+//         let mut password = String::new();
+//         fd_file
+//             .read_to_string(&mut password)
+//             .expect("Failed to read password from file descriptor");
+//         drop(fd_file); // Закрываем файл, так как он нам больше не нужен
+//         password
+//     } else if let Some(password) = env::var("SSHPASS").ok() {
+//         // Использование переменной окружения SSHPASS
+//         password
+//     } else {
+//         // Ввод пароля с клавиатуры
+//         println!("Enter Password:");
+//         let mut pass = TermRead::read_passwd(&mut std::io::stdin(), &mut std::io::stdout())
+//             .expect("Failed to read password from tty")
+//             .expect("Failed to read password from tty");
+//         let pass = _strip_nl(&mut pass);
+//         pass
+//         // rpassword::read_password().expect("Failed to read password from tty")
+//     }
+// }
+
+// fn _get_totp(_matches: &clap::ArgMatches) -> String {
+//     let secret = _matches
+//         .get_one::<String>("totp_secret")
+//         .expect("totp secret is required");
+//     _generate_totp(secret)
+//     // "get_totp".into()
+// }
+
+// fn _generate_totp(secret: &str) -> String {
+//     let totp = TOTP::new(
+//         Algorithm::SHA1,
+//         6,
+//         1,
+//         30,
+//         Secret::Raw(secret.as_bytes().to_vec()).to_bytes().unwrap(),
+//     )
+//     .unwrap();
+//     let token = totp.generate_current().unwrap();
+//     token
+// }
