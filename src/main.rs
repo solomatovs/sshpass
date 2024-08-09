@@ -202,12 +202,13 @@ fn run() -> Result<(), CliError> {
             let mut termios = get_termios(stdin.as_raw_fd())?;
             set_keypress_mode(&mut termios);
             set_termios(stdin.as_raw_fd(), &termios)?;
-      
+            
             // регистрирую сигналы ОС для обработки в приложении
             let mut mask = SigSet::empty();
             mask.add(nix::sys::signal::SIGINT);
             mask.add(nix::sys::signal::SIGTERM);
             mask.add(nix::sys::signal::SIGCHLD);
+            mask.add(nix::sys::signal::SIGSTOP);
 
             trace!("mask.thread_block()");
             mask.thread_block()
@@ -321,6 +322,10 @@ fn run() -> Result<(), CliError> {
                                 Ok(Signal::SIGCHLD) => {
                                     // проверяем завершение дочернего процесса
                                     trace!("recv SIGCHLD");
+                                }
+                                Ok(Signal::SIGSTOP) => {
+                                    // проверяем завершение дочернего процесса
+                                    trace!("recv SIGSTOP");
                                 }
                                 Ok(sig) => {
                                     trace!(
@@ -452,6 +457,7 @@ fn main() -> Result<(), CliError> {
             .required(true)
             .help("The user to log in as"))
         .arg(Arg::new("hostname")
+            .short('H')
             .required(true)
             .help("The hostname or IP address of the remote server"))
         .arg(Arg::new("password")
@@ -468,7 +474,6 @@ fn main() -> Result<(), CliError> {
             .short('d')
             .long("fd")
             .value_name("FD")
-            
             .help("Use number as file descriptor for getting password"))
         .arg(Arg::new("env")
             .short('e')
