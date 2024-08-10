@@ -23,7 +23,8 @@
                 "ssh",
                 "ubuntu_1"
             ],
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.vscode/.env",
         },
         {
             "type": "lldb",
@@ -39,7 +40,8 @@
                     "kind": "example"
                 }
             },
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.vscode/.env",
         },
     ]
 }
