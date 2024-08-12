@@ -1,7 +1,7 @@
+use std::io::Write;
 use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
-use std::io::Write;
 
 use nix::sys::signal::{kill, SigSet, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -22,10 +22,8 @@ use termios::{
 
 use clap::ArgMatches;
 
+use crate::app::{AppHandler, AppTransport};
 
-use crate::app::AppTransport;
-
-use super::App;
 
 #[derive(Debug)]
 pub enum NixError {
@@ -35,7 +33,6 @@ pub enum NixError {
 
     // ArgumentError(String),
     ExitCodeError(i32),
-
     // Ok,
 
     // ShutdownSendError,
@@ -117,9 +114,7 @@ fn get_termsize(stdin_fild: i32) -> std::io::Result<Box<nix::libc::winsize>> {
 }
 
 pub fn set_termsize(fd: i32, mut size: Box<nix::libc::winsize>) -> std::io::Result<()> {
-    let ret = unsafe {
-        nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &mut *size)
-    };
+    let ret = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &mut *size) };
 
     match ret {
         0 => Ok(()),
@@ -127,29 +122,58 @@ pub fn set_termsize(fd: i32, mut size: Box<nix::libc::winsize>) -> std::io::Resu
     }
 }
 
-pub struct NixApp
-{
+pub struct UnixTransport<'t, T>
+where T: AppHandler<'t> {
     pty: nix::pty::OpenptyResult,
-    app: App,
+    handler: &'t mut T
 }
 
-impl NixApp
+impl<'t, T> AppTransport for UnixTransport<'t, T>
+where T: AppHandler<'t>
 {
-    pub fn new(app: App) -> Result<Self, NixError> {
+    fn write_stdout(&self, buf: &[u8]) {
+        let mut stdout = std::io::stdout().lock();
+
+        if let Err(e) = stdout.write_all(&buf) {
+            trace!("Err(e) = stdout.write_all(&buf[..n])");
+            error!("stdout write error");
+            error!("{e}");
+        }
+        if let Err(e) = stdout.flush() {
+            trace!("Err(e) = stdout.write_all(&buf[..n])");
+            error!("stdout write error");
+            error!("{e}");
+        }
+    }
+
+    fn write_pty(&self, buf: &[u8]) {
+        if let Err(e) = write(self.pty.master.as_fd(), &buf) {
+            trace!("write(pty.master.as_fd()");
+            error!("error writing to pty");
+            error!("{e}");
+        }
+    }
+}
+
+impl<'t, T> UnixTransport<'t, T>
+where T: AppHandler<'t>
+{
+    pub fn new(handler: &'t mut T) -> Result<Self, NixError> {
         // Создаем псевдотерминал (PTY)
         let pty = openpty(None, None).expect("Failed to open PTY");
 
         Ok(Self {
             pty,
-            app,
+            handler,
         })
     }
 
-    pub fn run(&mut self, args: ArgMatches) -> Result<(), NixError> {
+    pub fn run(self: &mut Self, args: ArgMatches) -> Result<(), NixError> {
+        self.handler.init(&self);
         // Создаем псевдотерминал (PTY)
         // let slave = self.pty.slave;
         let master = self.pty.master.try_clone().expect("try_clone pty.master");
-        
+
         // fork() - создает дочерний процесс из текущего
         // parent блок это продолжение текущего запущенного процесса
         // child блок это то, что выполняется в дочернем процессе
@@ -161,13 +185,14 @@ impl NixApp
                 unsafe { nix::libc::ioctl(self.pty.slave.as_raw_fd(), nix::libc::TIOCSCTTY) };
                 // эта программа исполняется только в дочернем процессе
                 // родительский процесс в это же время выполняется и что то делает
-    
+
                 let program = args.get_one::<String>("program").unwrap();
                 let args = args.get_many::<String>("program_args").unwrap();
-    
+
                 // lambda функция для перенаправления stdio
-                let new_follower_stdio = || unsafe { Stdio::from_raw_fd(self.pty.slave.as_raw_fd()) };
-    
+                let new_follower_stdio =
+                    || unsafe { Stdio::from_raw_fd(self.pty.slave.as_raw_fd()) };
+
                 // ДАЛЬНЕЙШИЙ ЗАПУСК БЕЗ FORK ПРОЦЕССА
                 // это означает что дочерний процесс не будет еще раз разделятся
                 // Command будет выполняться под pid этого дочернего процесса и буквально станет им
@@ -178,9 +203,9 @@ impl NixApp
                     .stdout(new_follower_stdio())
                     .stderr(new_follower_stdio())
                     .exec();
-    
+
                 error!("child error: {e}");
-    
+
                 Err(e.into())
             }
             Ok(ForkResult::Parent { child }) => {
@@ -197,7 +222,7 @@ impl NixApp
                 let mut termios = get_termios(stdin.as_raw_fd())?;
                 set_keypress_mode(&mut termios);
                 set_termios(stdin.as_raw_fd(), &termios)?;
-                
+
                 // регистрирую сигналы ОС для обработки в приложении
                 let mut mask = SigSet::empty();
                 mask.add(nix::sys::signal::SIGINT);
@@ -205,11 +230,11 @@ impl NixApp
                 mask.add(nix::sys::signal::SIGCHLD);
                 mask.add(nix::sys::signal::SIGSTOP);
                 mask.add(nix::sys::signal::SIGWINCH);
-    
+
                 trace!("mask.thread_block()");
                 mask.thread_block()
                     .expect("pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(self), None) error");
-    
+
                 trace!("nix::sys::signalfd::SignalFd::with_flags(&mask, nix::sys::signalfd::SfdFlags::SFD_NONBLOCK | nix::sys::signalfd::SfdFlags::SFD_CLOEXEC);");
                 let signal_fd = nix::sys::signalfd::SignalFd::with_flags(
                     &mask,
@@ -218,17 +243,17 @@ impl NixApp
                 )
                 // let signal_fd = nix::sys::signalfd::SignalFd::new(&mask)
                 .expect("SignalFd error");
-    
+
                 // набор файловых указателей, которые будут обработаны poll
                 let mut fds = [
                     PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN),
                     PollFd::new(self.pty.master.as_fd(), PollFlags::POLLIN),
                     PollFd::new(stdin.as_fd(), PollFlags::POLLIN),
                 ];
-                
+
                 // Асинхронный обработчик
                 let mut buf = [0; 1024];
-                
+
                 let status = loop {
                     let mut is_timeout = false;
                     trace!("poll(&mut fds, PollTimeout::MAX)");
@@ -248,7 +273,7 @@ impl NixApp
                             trace!("poll match {} events", n);
                         }
                     };
-                    
+
                     trace!("fds: {:#?}", fds);
                     trace!("check child process {} is running...", child);
                     match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -281,7 +306,7 @@ impl NixApp
                                 "WaitStatus::Signaled(pid: {:?}, sig: {:?}, dumped: {:?})",
                                 pid, sig, _dumped
                             );
-    
+
                             break Ok(());
                         }
                         Ok(WaitStatus::Stopped(pid, sig)) => {
@@ -305,18 +330,18 @@ impl NixApp
                             trace!("WaitStatus::PtraceSyscall(pid: {:?})", pid);
                         }
                     }
-    
+
                     if is_timeout {
                         continue;
                     }
-    
+
                     trace!("check OS signal event...");
                     if let Some(nix::poll::PollFlags::POLLIN) = fds[0].revents() {
                         trace!("match OS signal: {:#?}", fds[0].revents());
                         match signal_fd.read_signal() {
                             Ok(Some(sig)) => {
                                 trace!("Some(res) = read_signal()");
-    
+
                                 match Signal::try_from(sig.ssi_signo as i32) {
                                     Ok(Signal::SIGINT) => {
                                         info!("recv SIGINT");
@@ -343,7 +368,8 @@ impl NixApp
                                         info!("recv SIGWINCH");
                                         if let Ok(size) = get_termsize(stdin.as_raw_fd()) {
                                             trace!("set termsize: {:#?}", size);
-                                            let res = set_termsize(self.pty.slave.as_raw_fd(), size);
+                                            let res =
+                                                set_termsize(self.pty.slave.as_raw_fd(), size);
                                             trace!("set_termsize: {:#?}", res);
                                         }
                                     }
@@ -363,7 +389,9 @@ impl NixApp
                                 trace!("Err(nix::errno::Errno::EAGAIN) = read_signal(), SFD_NONBLOCK flag is set");
                             }
                             Ok(None) => {
-                                trace!("Ok(None) = read_signal(), SFD_NONBLOCK flag is set possible");
+                                trace!(
+                                    "Ok(None) = read_signal(), SFD_NONBLOCK flag is set possible"
+                                );
                             }
                             Err(e) => {
                                 trace!("Err(e) = read_signal()");
@@ -372,12 +400,12 @@ impl NixApp
                         }
                         trace!("read OS signal after");
                     }
-    
+
                     trace!("check pty events...");
                     if let Some(nix::poll::PollFlags::POLLIN) = fds[1].revents() {
                         trace!("match pty event");
                         trace!("read(pty.master.as_raw_fd(), &mut buf[..])");
-    
+
                         match read(self.pty.master.as_raw_fd(), &mut buf) {
                             Err(nix::errno::Errno::EAGAIN) => {
                                 // SFD_NONBLOCK mode is set
@@ -397,23 +425,15 @@ impl NixApp
                                 // read n bytes
                                 trace!("Ok({n}) = read(pty.master)");
                                 trace!("utf8: {}", String::from_utf8_lossy(&buf[..n]));
-                                let f_write_stdout = Box::new(|b, bn| self.write_stdout(b, bn));
-                                let f_write_ptyout = Box::new(|b, bn| self.write_pty(b, bn));
-                                
-                                self.app.ptyin(
-                                    &buf, 
-                                    n, 
-                                    f_write_stdout,
-                                    f_write_ptyout,
-                                );
+                                self.handler.handle_ptyin(&buf[..n]);
+                                // self.write_stdout(&buf[..n]);
                             }
                         }
                     }
-    
+
                     trace!("check stdin events...");
                     if let Some(nix::poll::PollFlags::POLLIN) = fds[2].revents() {
                         trace!("read(stdin)");
-    
                         match read(stdin.as_raw_fd(), &mut buf) {
                             Err(nix::errno::Errno::EAGAIN) => {
                                 // SFD_NONBLOCK mode is set
@@ -432,35 +452,24 @@ impl NixApp
                             Ok(n) => {
                                 trace!("Ok({n}) = read(stdin)");
                                 trace!("utf8: {}", String::from_utf8_lossy(&buf[..n]));
-                                let f_write_stdout = Box::new(|b, bn| self.write_stdout(b, bn));
-                                let f_write_ptyout = Box::new(|b, bn| self.write_pty(b, bn));
 
-                                self.app.stdin(
-                                    &buf,
-                                    n,
-                                    f_write_stdout,
-                                    f_write_ptyout,
-                                );
-                                // if let Err(e) = write(self.pty.master.as_fd(), &buf[..n]) {
-                                //     trace!("write(pty.master.as_fd()");
-                                //     error!("error writing to pty");
-                                //     error!("{e}");
-                                // }
+                                // self.write_pty(&buf[..n]);
+                                self.handler.handle_stdin(&buf[..n]);
                             }
                         }
                     }
                 };
-    
+
                 // Восстанавливаем исходные атрибуты терминала
                 termios.c_lflag = c_lflag;
                 termios.c_iflag = c_iflag;
                 termios.c_oflag = c_oflag;
                 termios.c_cflag = c_cflag;
                 termios.c_cc = c_cc;
-    
+
                 trace!("termios resore: {:#?}", termios);
                 set_termios(stdin.as_raw_fd(), &mut termios)?;
-    
+
                 status
             }
             Err(e) => {
@@ -473,33 +482,8 @@ impl NixApp
                 Err(NixError::NixErrorno())
             }
         };
-    
+
         status
-    }    
-}
-
-
-impl AppTransport for NixApp {
-    fn write_stdout(&self, buf: &[u8], num: usize) {
-        let mut stdout = std::io::stdout().lock();
-
-        if let Err(e) = stdout.write_all(&buf[..num]) {
-            trace!("Err(e) = stdout.write_all(&buf[..n])");
-            error!("stdout write error");
-            error!("{e}");
-        }
-        if let Err(e) = stdout.flush() {
-            trace!("Err(e) = stdout.write_all(&buf[..n])");
-            error!("stdout write error");
-            error!("{e}");
-        }
     }
 
-    fn write_pty(&self, buf: &[u8], num: usize) {
-        if let Err(e) = write(self.pty.master.as_fd(), &buf[..num]) {
-            trace!("write(pty.master.as_fd()");
-            error!("error writing to pty");
-            error!("{e}");
-        }
-    }
 }

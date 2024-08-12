@@ -1,15 +1,14 @@
 use std::str::FromStr;
 
-use log::{error, trace};
 use clap::{Arg, ArgGroup, Command};
+use log::{error, trace};
 
 mod app;
-use app::{App, AppTransport};
+use app::App;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::NixApp;
-
+use unix::UnixTransport;
 
 fn cli() -> Command {
     let cmd = Command::new("sshpass")
@@ -166,10 +165,10 @@ fn main() {
     #[cfg(target_os = "linux")]
     {
         trace!("app ok, create unix app");
-        let app = App::new().unwrap();
-        let mut app = NixApp::new(app).unwrap();
-        let status = app.run(args);
-        
+        let mut app = App::new().unwrap();
+        let mut transport = UnixTransport::new(&mut app).unwrap();
+        let status = transport.run(args);
+
         if let Err(e) = status {
             error!("exit with error: {:?}", e);
         }

@@ -1,45 +1,55 @@
-use std::io::Write;
-use std::ops::{Fn, FnOnce, FnMut};
+use bytes::Buf;
 
-use log::{error, trace};
+#[derive(Debug)]
+pub enum AppError {}
 
-pub struct App {
-
+pub enum AppMessage {
+    Stdin(Box<dyn Buf>),
+    Stdout(Box<dyn Buf>),
+    Pty(Box<dyn Buf>),
 }
 
 pub trait AppTransport {
-    fn write_stdout(&self, buf: &[u8], num: usize);
-    fn write_pty(&self, buf: &[u8], num: usize);
+    fn write_stdout(&self, buf: &[u8]);
+    fn write_pty(&self, buf: &[u8]);
 }
 
-#[derive(Debug)]
-pub enum AppError {
-    
+pub trait AppHandler<'t> {
+
+    fn init<A: AppTransport>(&mut self, trans: &'t A);
+
+    fn handle_stdin(&self, buf: &[u8]);
+
+    fn handle_ptyin(&self, buf: &[u8]);
+}
+pub struct App<'t>
+{
+    trans: Option<&'t dyn AppTransport>,
 }
 
-impl App {
+impl<'t> App<'t>
+{
     pub fn new() -> Result<Self, AppError> {
         Ok(Self {
+            trans: None,
         })
     }
+}
 
-    pub fn ptyin<'b, FSTD: Fn(&'b [u8], usize), FPTY: Fn(&'b [u8], usize)>(
-        &self,
-        buf: &'b [u8],
-        num: usize,
-        write_stdout: FSTD,
-        _write_ptyout: FPTY,
-    ) {
-        write_stdout(&buf, num);
+impl<'t> AppHandler<'t> for App<'t> {
+    fn init<A: AppTransport>(self: &mut Self, trans: &'t A) {
+        self.trans = Some(trans);
     }
 
-    pub fn stdin<'b, FSTD: Fn(&'b [u8], usize), FPTY: Fn(&'b [u8], usize)>(
-        &self,
-        buf: &'b [u8],
-        num: usize,
-        _write_stdout: FSTD,
-        write_ptyout: FPTY,
-    ) {
-        write_ptyout(&buf, num);
+    fn handle_stdin(&self, buf: &[u8]) {
+        if let Some(trans) = self.trans {
+            trans.write_pty(buf);
+        }
+    }
+
+    fn handle_ptyin(&self, buf: &[u8]) {
+        if let Some(trans) = self.trans {
+            trans.write_stdout(buf);
+        }
     }
 }

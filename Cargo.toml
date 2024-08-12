@@ -33,3 +33,4 @@ termios = "0.3.3"
 # mio-signals = {version = "0.2.0", feature=["all"]}
 log = {version = "0.4.22"}
 clap = { version = "4.5.9", features = ["derive", "env"] }
+bytes = "1.7.1"
