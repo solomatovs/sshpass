@@ -2,6 +2,7 @@ use std::io::Write;
 use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
+use std::cell::{Ref, RefCell};
 
 use nix::sys::signal::{kill, SigSet, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -10,6 +11,7 @@ use log::{debug, error, info, trace};
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::signalfd::{SignalFd, SfdFlags};
+use nix::errno::Errno::{EINTR, ECHILD};
 use nix::{
     poll::{poll, PollFd, PollFlags, PollTimeout},
     unistd::{read, write},
@@ -25,56 +27,6 @@ use clap::ArgMatches;
 
 use crate::app::SpecifiedApp;
 
-
-#[derive(Debug)]
-pub enum UnixError {
-    StdIoError(std::io::Error),
-
-    NixErrorno(),
-
-    // ArgumentError(String),
-    ExitCodeError(i32),
-    // Ok,
-
-    // ShutdownSendError,
-
-    // ChildTerminatedBySignal,
-}
-
-impl std::fmt::Display for UnixError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NixError")
-    }
-}
-
-impl std::error::Error for UnixError {
-
-}
-
-// impl Into<Box<dyn std::error::Error>> for NixError {
-//     fn into(self) -> Box<dyn std::error::Error> {
-//         let err: Box<dyn std::error::Error> = Box::new(self);
-//         err
-//     }
-// }
-
-impl From<std::io::Error> for UnixError {
-    fn from(error: std::io::Error) -> Self {
-        UnixError::StdIoError(error)
-    }
-}
-
-impl From<nix::errno::Errno> for UnixError {
-    fn from(_: nix::errno::Errno) -> Self {
-        UnixError::NixErrorno()
-    }
-}
-
-impl From<i32> for UnixError {
-    fn from(error: i32) -> Self {
-        UnixError::ExitCodeError(error)
-    }
-}
 
 // Флаг          Значение
 // ISIG          Разрешить посылку сигналов
@@ -143,10 +95,10 @@ pub fn set_termsize(fd: i32, mut size: Box<nix::libc::winsize>) -> std::io::Resu
 pub struct UnixApp{
     pty: OpenptyResult,
     termios: Termios,
-    buf: [u8; 1024],
     signal_fd: SignalFd,
     stdin: std::io::StdinLock<'static>,
     child: Pid,
+    buf: RefCell<[u8; 1024]>,
 }
 
 impl UnixApp {
@@ -218,7 +170,7 @@ impl UnixApp {
                 let res = Self {
                     pty,
                     termios,
-                    buf: [0; 1024],
+                    buf: RefCell::new([0; 1024]),
                     stdin,
                     signal_fd,
                     child,
@@ -260,29 +212,6 @@ impl UnixApp {
 
         Ok(())
     }
-
-    fn write_stdout(&self, buf: &[u8]) {
-        let mut stdout = std::io::stdout().lock();
-
-        if let Err(e) = stdout.write_all(&buf) {
-            trace!("Err(e) = stdout.write_all(&buf[..n])");
-            error!("stdout write error");
-            error!("{e}");
-        }
-        if let Err(e) = stdout.flush() {
-            trace!("Err(e) = stdout.write_all(&buf[..n])");
-            error!("stdout write error");
-            error!("{e}");
-        }
-    }
-
-    fn write_pty(&self, buf: &[u8]) {
-        if let Err(e) = write(self.pty.master.as_fd(), &buf) {
-            trace!("write(pty.master.as_fd()");
-            error!("error writing to pty");
-            error!("{e}");
-        }
-    }
 }
 
 impl Drop for UnixApp {
@@ -291,13 +220,99 @@ impl Drop for UnixApp {
             error!("deinit error: {:#?}", e);
         }
     }
-} 
+}
 
-impl SpecifiedApp<UnixError> for UnixApp
-{
-    fn process_event(&mut self) -> Result<bool, UnixError> {
+#[derive(Debug)]
+pub enum UnixEvent<'a> {
+    Ptyin(Ref<'a, [u8]>, usize),
+    Stdin(Ref<'a, [u8]>, usize),
+    Timeout,
+    ChildExited(Pid, i32),
+    ChildSignaled(Pid, Signal, bool),
+    StdIoError(std::io::Error),
+    NixErrorno(nix::errno::Errno),
+    EventNotCapture,
+}
+
+impl<'a> std::fmt::Display for UnixEvent<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UnixEvent")
+    }
+}
+
+impl<'a> From<std::io::Error> for UnixEvent<'a> {
+    fn from(e: std::io::Error) -> Self {
+        UnixEvent::StdIoError(e)
+    }
+}
+
+impl<'a> From<nix::errno::Errno> for UnixEvent<'a> {
+    fn from(e: nix::errno::Errno) -> Self {
+        UnixEvent::NixErrorno(e)
+    }
+}
+
+// impl<'a> From<WaitStatus> for UnixEvent<'a> {
+//     fn from(e: WaitStatus) -> Self {
+//         UnixEvent::WaitStatus(e)
+//     }
+// }
+
+
+
+#[derive(Debug)]
+pub enum UnixError {
+    StdIoError(std::io::Error),
+
+    NixErrorno(),
+
+    // ArgumentError(String),
+    ExitCodeError(i32),
+    // Ok,
+
+    // ShutdownSendError,
+
+    // ChildTerminatedBySignal,
+}
+
+impl std::fmt::Display for UnixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NixError")
+    }
+}
+
+impl std::error::Error for UnixError {
+
+}
+
+impl From<std::io::Error> for UnixError {
+    fn from(error: std::io::Error) -> Self {
+        UnixError::StdIoError(error)
+    }
+}
+
+impl From<nix::errno::Errno> for UnixError {
+    fn from(_: nix::errno::Errno) -> Self {
+        UnixError::NixErrorno()
+    }
+}
+
+impl From<i32> for UnixError {
+    fn from(error: i32) -> Self {
+        UnixError::ExitCodeError(error)
+    }
+}
+
+impl<'a> SpecifiedApp<'a, UnixEvent<'a>> for UnixApp {
+    fn poll(&'a self, timeout: i32) -> UnixEvent<'a> {
         let mut is_timeout = false;
-        trace!("poll(&mut fds, PollTimeout::MAX)");
+        let timeout = match timeout {
+            -1 => PollTimeout::NONE,
+            0 => PollTimeout::ZERO,
+            i32::MAX => PollTimeout::MAX,
+            n => PollTimeout::try_from(n).unwrap(),
+        };
+        trace!("poll(&mut fds, {:?})", timeout);
 
         // набор файловых указателей, которые будут обработаны poll
         let mut fds = [
@@ -306,12 +321,12 @@ impl SpecifiedApp<UnixError> for UnixApp
             PollFd::new(self.stdin.as_fd(), PollFlags::POLLIN),
         ];
 
-        match poll(&mut fds, PollTimeout::MAX) {
+        match poll(&mut fds, timeout) {
             Err(e) => {
                 // error poll calling
                 error!("poll calling error: {}", e);
                 // break Err(e.into());
-                return Err(e.into())
+                return e.into()
             }
             Ok(0) => {
                 // timeout
@@ -327,29 +342,25 @@ impl SpecifiedApp<UnixError> for UnixApp
         // trace!("fds: {:#?}", self.fds);
         trace!("check child process {} is running...", self.child);
         match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
-            Err(nix::errno::Errno::ECHILD) => {
+            Err(ECHILD) => {
                 error!(
                     "the process {} is not a child of the process: {:?}",
                     self.child,
                     std::thread::current().id()
                 );
-                return Ok(false);
+                return UnixEvent::NixErrorno(ECHILD);
             }
-            Err(nix::errno::Errno::EINTR) => {
-                error!("waitpid error: {}", nix::errno::Errno::EINTR);
-                return Err(UnixError::NixErrorno());
+            Err(EINTR) => {
+                error!("waitpid error: {}", EINTR);
+                return UnixEvent::NixErrorno(EINTR);
             }
             Err(e) => {
                 error!("waitpid error: {}", e);
-                return Err(e.into());
+                return e.into()
             }
             Ok(WaitStatus::Exited(pid, status)) => {
                 info!("WaitStatus::Exited(pid: {:?}, status: {:?}", pid, status);
-                if status != 0 {
-                    return Err(UnixError::ExitCodeError(status));
-                } else {
-                    return Ok(false);
-                }
+                return UnixEvent::ChildExited(pid, status);
             }
             Ok(WaitStatus::Signaled(pid, sig, _dumped)) => {
                 info!(
@@ -357,7 +368,7 @@ impl SpecifiedApp<UnixError> for UnixApp
                     pid, sig, _dumped
                 );
 
-                return Ok(false);
+                return UnixEvent::ChildSignaled(pid, sig, _dumped);
             }
             Ok(WaitStatus::Stopped(pid, sig)) => {
                 debug!("WaitStatus::Stopped(pid: {:?}, sig: {:?})", pid, sig);
@@ -382,11 +393,11 @@ impl SpecifiedApp<UnixError> for UnixApp
         }
 
         if is_timeout {
-            return Ok(true);
+            return UnixEvent::Timeout;
         }
 
         trace!("check OS signal event...");
-        if let Some(nix::poll::PollFlags::POLLIN) = fds[0].revents() {
+        if let Some(PollFlags::POLLIN) = fds[0].revents() {
             trace!("match OS signal: {:#?}", fds[0].revents());
             match self.signal_fd.read_signal() {
                 Ok(Some(sig)) => {
@@ -451,11 +462,14 @@ impl SpecifiedApp<UnixError> for UnixApp
         }
 
         trace!("check pty events...");
-        if let Some(nix::poll::PollFlags::POLLIN) = fds[1].revents() {
+        if let Some(PollFlags::POLLIN) = fds[1].revents() {
             trace!("match pty event");
             trace!("read(pty.master.as_raw_fd(), &mut buf[..])");
 
-            match read(self.pty.master.as_raw_fd(), &mut self.buf) {
+            let res = {
+                read(self.pty.master.as_raw_fd(), self.buf.borrow_mut().as_mut())
+            };
+            match res {
                 Err(nix::errno::Errno::EAGAIN) => {
                     // SFD_NONBLOCK mode is set
                     trace!("Err(nix::errno::Errno::EAGAIN) = read(pty.master), SFD_NONBLOCK flag is set");
@@ -473,17 +487,22 @@ impl SpecifiedApp<UnixError> for UnixApp
                 Ok(n) => {
                     // read n bytes
                     trace!("Ok({n}) = read(pty.master)");
-                    trace!("utf8: {}", String::from_utf8_lossy(&self.buf[..n]));
+                    trace!("utf8: {}", String::from_utf8_lossy(&self.buf.borrow()[..n]));
                     // self.handler.handle_ptyin(&self.buf[..n]);
-                    self.write_stdout(&self.buf[..n]);
+                    // let sdf = self.buf.as_ptr();
+                    return UnixEvent::Ptyin(self.buf.borrow(), n);
+                    // self.write_stdout(&self.buf[..n]);
                 }
             }
         }
 
         trace!("check stdin events...");
-        if let Some(nix::poll::PollFlags::POLLIN) = fds[2].revents() {
+        if let Some(PollFlags::POLLIN) = fds[2].revents() {
             trace!("read(stdin)");
-            match read(self.stdin.as_raw_fd(), &mut self.buf) {
+            let res = {
+                read(self.stdin.as_raw_fd(), self.buf.borrow_mut().as_mut())
+            };
+            match res {
                 Err(nix::errno::Errno::EAGAIN) => {
                     // SFD_NONBLOCK mode is set
                     trace!("Err(nix::errno::Errno::EAGAIN) = read(stdin), SFD_NONBLOCK flag is set");
@@ -500,14 +519,40 @@ impl SpecifiedApp<UnixError> for UnixApp
                 }
                 Ok(n) => {
                     trace!("Ok({n}) = read(stdin)");
-                    trace!("utf8: {}", String::from_utf8_lossy(&self.buf[..n]));
+                    trace!("utf8: {}", String::from_utf8_lossy(&self.buf.borrow()[..n]));
 
-                    self.write_pty(&self.buf[..n]);
+                    return UnixEvent::Stdin(self.buf.borrow(), n);
+                    // self.write_pty(&self.buf[..n]);
                     // self.handler.handle_stdin(&self.buf[..n]);
                 }
             }
         }
 
-        Ok(true)
+        UnixEvent::EventNotCapture
+    }
+
+
+    fn write_stdout(&self, buf: &[u8]) {
+        let mut stdout = std::io::stdout().lock();
+
+        if let Err(e) = stdout.write_all(&buf) {
+            trace!("Err(e) = stdout.write_all(&buf[..n])");
+            error!("stdout write error");
+            error!("{e}");
+        }
+        if let Err(e) = stdout.flush() {
+            trace!("Err(e) = stdout.write_all(&buf[..n])");
+            error!("stdout write error");
+            error!("{e}");
+        }
+    }
+
+    fn write_pty(&self, buf: &[u8]) {
+        if let Err(e) = write(self.pty.master.as_fd(), &buf) {
+            trace!("write(pty.master.as_fd()");
+            error!("error writing to pty");
+            error!("{e}");
+        }
     }
 }
+

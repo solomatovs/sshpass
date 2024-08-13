@@ -1,7 +1,7 @@
-pub trait SpecifiedApp<E: std::error::Error> {
-    fn process_event(&mut self) -> Result<bool, E>;
-    // fn write_stdout(&self, buf: &[u8]);
-    // fn write_pty(&self, buf: &[u8]);
+pub trait SpecifiedApp<'a, R> {
+    fn poll(&'a self, timeout: i32) -> R;
+    fn write_stdout(&'a self, buf: &'a [u8]);
+    fn write_pty(&'a self, buf: &'a [u8]);
 }
 
 // pub trait MainApp {

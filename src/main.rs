@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{borrow::Borrow, str::FromStr};
 
 use clap::{Arg, ArgGroup, Command};
 use log::{error, trace};
@@ -8,7 +8,7 @@ use app::SpecifiedApp;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::UnixApp;
+use unix::{UnixApp, UnixEvent};
 
 fn cli() -> Command {
     let cmd = Command::new("sshpass")
@@ -168,13 +168,32 @@ fn main() {
         let mut unix_app = UnixApp::new(args).unwrap();
 
         loop {
-            match unix_app.process_event() {
-                Ok(false) => continue,
-                Ok(true) => break,
-                Err(e) => {
-                    error!("exit with error: {:?}", e);
+            let ref_p = unix_app.poll(-1);
+            match ref_p {
+                UnixEvent::EventNotCapture => {},
+                UnixEvent::Timeout => {},
+                UnixEvent::NixErrorno(e) => {
                     break;
-                }
+                },
+                UnixEvent::StdIoError(e) => {
+                    break;
+                },
+                UnixEvent::ChildExited(pid, status) => {
+                    break;
+                },
+                UnixEvent::ChildSignaled(pid, signal, dumped) => {
+                    break;
+                },
+                UnixEvent::Ptyin(buf, num) => {
+                    // unix_app.write_stdout(buf);
+                    unix_app.write_stdout(&buf.borrow()[..num]);
+                    // trace!("buf: {:#?}", buf);
+
+                },
+                UnixEvent::Stdin(buf, num) => {
+                    unix_app.write_pty(&buf.borrow()[..num]);
+                    // trace!("buf: {:#?}", buf);
+                },
             }
         };
     }
