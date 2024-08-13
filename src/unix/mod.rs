@@ -7,8 +7,9 @@ use nix::sys::signal::{kill, SigSet, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
 use log::{debug, error, info, trace};
-use nix::pty::openpty;
-use nix::unistd::{fork, ForkResult};
+use nix::pty::{openpty, OpenptyResult};
+use nix::unistd::{fork, ForkResult, Pid};
+use nix::sys::signalfd::{SignalFd, SfdFlags};
 use nix::{
     poll::{poll, PollFd, PollFlags, PollTimeout},
     unistd::{read, write},
@@ -22,11 +23,11 @@ use termios::{
 
 use clap::ArgMatches;
 
-use crate::app::{AppHandler, AppTransport};
+use crate::app::SpecifiedApp;
 
 
 #[derive(Debug)]
-pub enum NixError {
+pub enum UnixError {
     StdIoError(std::io::Error),
 
     NixErrorno(),
@@ -40,21 +41,38 @@ pub enum NixError {
     // ChildTerminatedBySignal,
 }
 
-impl From<std::io::Error> for NixError {
+impl std::fmt::Display for UnixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NixError")
+    }
+}
+
+impl std::error::Error for UnixError {
+
+}
+
+// impl Into<Box<dyn std::error::Error>> for NixError {
+//     fn into(self) -> Box<dyn std::error::Error> {
+//         let err: Box<dyn std::error::Error> = Box::new(self);
+//         err
+//     }
+// }
+
+impl From<std::io::Error> for UnixError {
     fn from(error: std::io::Error) -> Self {
-        NixError::StdIoError(error)
+        UnixError::StdIoError(error)
     }
 }
 
-impl From<nix::errno::Errno> for NixError {
+impl From<nix::errno::Errno> for UnixError {
     fn from(_: nix::errno::Errno) -> Self {
-        NixError::NixErrorno()
+        UnixError::NixErrorno()
     }
 }
 
-impl From<i32> for NixError {
+impl From<i32> for UnixError {
     fn from(error: i32) -> Self {
-        NixError::ExitCodeError(error)
+        UnixError::ExitCodeError(error)
     }
 }
 
@@ -122,15 +140,127 @@ pub fn set_termsize(fd: i32, mut size: Box<nix::libc::winsize>) -> std::io::Resu
     }
 }
 
-pub struct UnixTransport<'t, T>
-where T: AppHandler<'t> {
-    pty: nix::pty::OpenptyResult,
-    handler: &'t mut T
+pub struct UnixApp{
+    pty: OpenptyResult,
+    termios: Termios,
+    buf: [u8; 1024],
+    signal_fd: SignalFd,
+    stdin: std::io::StdinLock<'static>,
+    child: Pid,
 }
 
-impl<'t, T> AppTransport for UnixTransport<'t, T>
-where T: AppHandler<'t>
-{
+impl UnixApp {
+    pub fn new(args: ArgMatches) -> Result<Self, UnixError> {
+        // Создаем псевдотерминал (PTY)
+        let pty = openpty(None, None).expect("Failed to open PTY");
+
+        // fork() - создает дочерний процесс из текущего
+        // parent блок это продолжение текущего запущенного процесса
+        // child блок это то, что выполняется в дочернем процессе
+        // все окружение дочернего процесса наследуется из родительского
+        let status = match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                let master = pty.master.try_clone().expect("try_clone pty.master");
+                unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCNOTTY) };
+                unsafe { nix::libc::setsid() };
+                unsafe { nix::libc::ioctl(pty.slave.as_raw_fd(), nix::libc::TIOCSCTTY) };
+                // эта программа исполняется только в дочернем процессе
+                // родительский процесс в это же время выполняется и что то делает
+
+                let program = args.get_one::<String>("program").unwrap();
+                let args = args.get_many::<String>("program_args").unwrap();
+
+                // lambda функция для перенаправления stdio
+                let new_follower_stdio =
+                    || unsafe { Stdio::from_raw_fd(pty.slave.as_raw_fd()) };
+
+                // ДАЛЬНЕЙШИЙ ЗАПУСК БЕЗ FORK ПРОЦЕССА
+                // это означает что дочерний процесс не будет еще раз разделятся
+                // Command будет выполняться под pid этого дочернего процесса и буквально станет им
+                // осуществляется всё это с помощью exec()
+                let e = std::process::Command::new(program)
+                    .args(args)
+                    .stdin(new_follower_stdio())
+                    .stdout(new_follower_stdio())
+                    .stderr(new_follower_stdio())
+                    .exec();
+
+                error!("child error: {e}");
+
+                Err(e.into())
+            }
+            Ok(ForkResult::Parent { child }) => {
+                // // эта програма исполняется только в родительском процессе
+                let stdin = std::io::stdin().lock();
+                let termios = get_termios(stdin.as_raw_fd())?;
+                let mut termios_modify = get_termios(stdin.as_raw_fd())?;
+                set_keypress_mode(&mut termios_modify);
+                set_termios(stdin.as_raw_fd(), &termios_modify)?;
+
+                // регистрирую сигналы ОС для обработки в приложении
+                let mut mask = SigSet::empty();
+                mask.add(nix::sys::signal::SIGINT);
+                mask.add(nix::sys::signal::SIGTERM);
+                mask.add(nix::sys::signal::SIGCHLD);
+                mask.add(nix::sys::signal::SIGSTOP);
+                mask.add(nix::sys::signal::SIGWINCH);
+
+                trace!("mask.thread_block()");
+                mask.thread_block().expect("pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(self), None) error");
+
+                trace!("nix::sys::signalfd::SignalFd::with_flags(&mask, nix::sys::signalfd::SfdFlags::SFD_NONBLOCK | nix::sys::signalfd::SfdFlags::SFD_CLOEXEC);");
+                let signal_fd = SignalFd::with_flags(
+                    &mask,
+                    SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC,
+                )
+                .expect("SignalFd error");
+
+                let res = Self {
+                    pty,
+                    termios,
+                    buf: [0; 1024],
+                    stdin,
+                    signal_fd,
+                    child,
+                };
+
+                Ok(res)
+            }
+            Err(e) => {
+                error!(
+                    "{:?}: {:?}: Fork failed: {}",
+                    std::thread::current().id(),
+                    std::time::SystemTime::now(),
+                    e
+                );
+                Err(UnixError::NixErrorno())
+            }
+        };
+
+        status
+    }
+
+    fn deinit(&mut self) -> Result<(), UnixError> {
+        // Восстанавливаем исходные атрибуты терминала
+        // termios.c_lflag = self.termios.c_lflag;
+        // termios.c_iflag = self.termios.c_iflag;
+        // termios.c_oflag = self.termios.c_oflag;
+        // termios.c_cflag = self.termios.c_cflag;
+        // termios.c_cc = self.termios.c_cc;
+
+        trace!("termios resore: {:#?}", self.termios);
+        
+        set_termios(self.stdin.as_raw_fd(), &self.termios)?;
+
+        // drop(self.pty.master.as_fd());
+        // drop(self.pty.slave.as_fd());
+        // drop(self.signal_fd.as_fd());
+        // drop(self.stdin.as_fd());
+        // drop(self.child.as_raw());
+
+        Ok(())
+    }
+
     fn write_stdout(&self, buf: &[u8]) {
         let mut stdout = std::io::stdout().lock();
 
@@ -155,335 +285,229 @@ where T: AppHandler<'t>
     }
 }
 
-impl<'t, T> UnixTransport<'t, T>
-where T: AppHandler<'t>
-{
-    pub fn new(handler: &'t mut T) -> Result<Self, NixError> {
-        // Создаем псевдотерминал (PTY)
-        let pty = openpty(None, None).expect("Failed to open PTY");
-
-        Ok(Self {
-            pty,
-            handler,
-        })
+impl Drop for UnixApp {
+    fn drop(&mut self) {
+        if let Err(e) = self.deinit() {
+            error!("deinit error: {:#?}", e);
+        }
     }
+} 
 
-    pub fn run(self: &mut Self, args: ArgMatches) -> Result<(), NixError> {
-        self.handler.init(&self);
-        // Создаем псевдотерминал (PTY)
-        // let slave = self.pty.slave;
-        let master = self.pty.master.try_clone().expect("try_clone pty.master");
+impl SpecifiedApp<UnixError> for UnixApp
+{
+    fn process_event(&mut self) -> Result<bool, UnixError> {
+        let mut is_timeout = false;
+        trace!("poll(&mut fds, PollTimeout::MAX)");
 
-        // fork() - создает дочерний процесс из текущего
-        // parent блок это продолжение текущего запущенного процесса
-        // child блок это то, что выполняется в дочернем процессе
-        // все окружение дочернего процесса наследуется из родительского
-        let status = match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCNOTTY) };
-                unsafe { nix::libc::setsid() };
-                unsafe { nix::libc::ioctl(self.pty.slave.as_raw_fd(), nix::libc::TIOCSCTTY) };
-                // эта программа исполняется только в дочернем процессе
-                // родительский процесс в это же время выполняется и что то делает
+        // набор файловых указателей, которые будут обработаны poll
+        let mut fds = [
+            PollFd::new(self.signal_fd.as_fd(), PollFlags::POLLIN),
+            PollFd::new(self.pty.master.as_fd(), PollFlags::POLLIN),
+            PollFd::new(self.stdin.as_fd(), PollFlags::POLLIN),
+        ];
 
-                let program = args.get_one::<String>("program").unwrap();
-                let args = args.get_many::<String>("program_args").unwrap();
-
-                // lambda функция для перенаправления stdio
-                let new_follower_stdio =
-                    || unsafe { Stdio::from_raw_fd(self.pty.slave.as_raw_fd()) };
-
-                // ДАЛЬНЕЙШИЙ ЗАПУСК БЕЗ FORK ПРОЦЕССА
-                // это означает что дочерний процесс не будет еще раз разделятся
-                // Command будет выполняться под pid этого дочернего процесса и буквально станет им
-                // осуществляется всё это с помощью exec()
-                let e = std::process::Command::new(program)
-                    .args(args)
-                    .stdin(new_follower_stdio())
-                    .stdout(new_follower_stdio())
-                    .stderr(new_follower_stdio())
-                    .exec();
-
-                error!("child error: {e}");
-
-                Err(e.into())
-            }
-            Ok(ForkResult::Parent { child }) => {
-                let stdin = std::io::stdin();
-                let termios = get_termios(stdin.as_raw_fd())?;
-                trace!("termios backup: {:#?}", termios);
-                let c_lflag = termios.c_lflag;
-                let c_iflag = termios.c_iflag;
-                let c_oflag = termios.c_oflag;
-                let c_cflag = termios.c_cflag;
-                let c_cc = termios.c_cc;
-                // // эта програма исполняется только в родительском процессе
-                let stdin = std::io::stdin().lock();
-                let mut termios = get_termios(stdin.as_raw_fd())?;
-                set_keypress_mode(&mut termios);
-                set_termios(stdin.as_raw_fd(), &termios)?;
-
-                // регистрирую сигналы ОС для обработки в приложении
-                let mut mask = SigSet::empty();
-                mask.add(nix::sys::signal::SIGINT);
-                mask.add(nix::sys::signal::SIGTERM);
-                mask.add(nix::sys::signal::SIGCHLD);
-                mask.add(nix::sys::signal::SIGSTOP);
-                mask.add(nix::sys::signal::SIGWINCH);
-
-                trace!("mask.thread_block()");
-                mask.thread_block()
-                    .expect("pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(self), None) error");
-
-                trace!("nix::sys::signalfd::SignalFd::with_flags(&mask, nix::sys::signalfd::SfdFlags::SFD_NONBLOCK | nix::sys::signalfd::SfdFlags::SFD_CLOEXEC);");
-                let signal_fd = nix::sys::signalfd::SignalFd::with_flags(
-                    &mask,
-                    nix::sys::signalfd::SfdFlags::SFD_NONBLOCK
-                        | nix::sys::signalfd::SfdFlags::SFD_CLOEXEC,
-                )
-                // let signal_fd = nix::sys::signalfd::SignalFd::new(&mask)
-                .expect("SignalFd error");
-
-                // набор файловых указателей, которые будут обработаны poll
-                let mut fds = [
-                    PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN),
-                    PollFd::new(self.pty.master.as_fd(), PollFlags::POLLIN),
-                    PollFd::new(stdin.as_fd(), PollFlags::POLLIN),
-                ];
-
-                // Асинхронный обработчик
-                let mut buf = [0; 1024];
-
-                let status = loop {
-                    let mut is_timeout = false;
-                    trace!("poll(&mut fds, PollTimeout::MAX)");
-                    match poll(&mut fds, PollTimeout::MAX) {
-                        Err(e) => {
-                            // error poll calling
-                            error!("poll calling error: {}", e);
-                            break Err(e.into());
-                        }
-                        Ok(0) => {
-                            // timeout
-                            trace!("poll timeout: Ok(0)");
-                            is_timeout = true;
-                        }
-                        Ok(n) => {
-                            // match n events
-                            trace!("poll match {} events", n);
-                        }
-                    };
-
-                    trace!("fds: {:#?}", fds);
-                    trace!("check child process {} is running...", child);
-                    match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-                        Err(nix::errno::Errno::ECHILD) => {
-                            error!(
-                                "the process {} is not a child of the process: {:?}",
-                                child,
-                                std::thread::current().id()
-                            );
-                            break Ok(());
-                        }
-                        Err(nix::errno::Errno::EINTR) => {
-                            error!("waitpid error: {}", nix::errno::Errno::EINTR);
-                            break Err(NixError::NixErrorno());
-                        }
-                        Err(e) => {
-                            error!("waitpid error: {}", e);
-                            break Err(e.into());
-                        }
-                        Ok(WaitStatus::Exited(pid, status)) => {
-                            info!("WaitStatus::Exited(pid: {:?}, status: {:?}", pid, status);
-                            if status != 0 {
-                                break Err(NixError::ExitCodeError(status));
-                            } else {
-                                break Ok(());
-                            }
-                        }
-                        Ok(WaitStatus::Signaled(pid, sig, _dumped)) => {
-                            info!(
-                                "WaitStatus::Signaled(pid: {:?}, sig: {:?}, dumped: {:?})",
-                                pid, sig, _dumped
-                            );
-
-                            break Ok(());
-                        }
-                        Ok(WaitStatus::Stopped(pid, sig)) => {
-                            debug!("WaitStatus::Stopped(pid: {:?}, sig: {:?})", pid, sig);
-                        }
-                        Ok(WaitStatus::StillAlive) => {
-                            trace!("WaitStatus::StillAlive");
-                        }
-                        Ok(WaitStatus::Continued(pid)) => {
-                            trace!("WaitStatus::Continued(pid: {:?})", pid);
-                        }
-                        Ok(WaitStatus::PtraceEvent(pid, sig, c)) => {
-                            trace!(
-                                "WaitStatus::PtraceEvent(pid: {:?}, sig: {:?}, c: {:?})",
-                                pid,
-                                sig,
-                                c
-                            );
-                        }
-                        Ok(WaitStatus::PtraceSyscall(pid)) => {
-                            trace!("WaitStatus::PtraceSyscall(pid: {:?})", pid);
-                        }
-                    }
-
-                    if is_timeout {
-                        continue;
-                    }
-
-                    trace!("check OS signal event...");
-                    if let Some(nix::poll::PollFlags::POLLIN) = fds[0].revents() {
-                        trace!("match OS signal: {:#?}", fds[0].revents());
-                        match signal_fd.read_signal() {
-                            Ok(Some(sig)) => {
-                                trace!("Some(res) = read_signal()");
-
-                                match Signal::try_from(sig.ssi_signo as i32) {
-                                    Ok(Signal::SIGINT) => {
-                                        info!("recv SIGINT");
-                                        trace!("kill({child}, SIGINT");
-                                        if let Err(nix::errno::Errno::ESRCH) =
-                                            kill(child, Signal::SIGINT)
-                                        {
-                                            error!("pid {child} doesnt exists or zombie");
-                                        }
-                                    }
-                                    Ok(Signal::SIGTERM) => {
-                                        info!("recv SIGTERM");
-                                        trace!("kill({child}, SIGTERM");
-                                        if let Err(nix::errno::Errno::ESRCH) =
-                                            kill(child, Signal::SIGTERM)
-                                        {
-                                            error!("pid {child} doesnt exists or zombie");
-                                        }
-                                    }
-                                    Ok(Signal::SIGCHLD) => {
-                                        info!("recv SIGCHLD");
-                                    }
-                                    Ok(Signal::SIGWINCH) => {
-                                        info!("recv SIGWINCH");
-                                        if let Ok(size) = get_termsize(stdin.as_raw_fd()) {
-                                            trace!("set termsize: {:#?}", size);
-                                            let res =
-                                                set_termsize(self.pty.slave.as_raw_fd(), size);
-                                            trace!("set_termsize: {:#?}", res);
-                                        }
-                                    }
-                                    Ok(Signal::SIGSTOP) => {
-                                        info!("recv SIGSTOP");
-                                    }
-                                    Ok(sig) => {
-                                        info!("recv signal {}", sig);
-                                    }
-                                    Err(e) => {
-                                        error!("recv unknown signal");
-                                        error!("{e}");
-                                    }
-                                }
-                            }
-                            Err(nix::errno::Errno::EAGAIN) => {
-                                trace!("Err(nix::errno::Errno::EAGAIN) = read_signal(), SFD_NONBLOCK flag is set");
-                            }
-                            Ok(None) => {
-                                trace!(
-                                    "Ok(None) = read_signal(), SFD_NONBLOCK flag is set possible"
-                                );
-                            }
-                            Err(e) => {
-                                trace!("Err(e) = read_signal()");
-                                error!("{}", e);
-                            }
-                        }
-                        trace!("read OS signal after");
-                    }
-
-                    trace!("check pty events...");
-                    if let Some(nix::poll::PollFlags::POLLIN) = fds[1].revents() {
-                        trace!("match pty event");
-                        trace!("read(pty.master.as_raw_fd(), &mut buf[..])");
-
-                        match read(self.pty.master.as_raw_fd(), &mut buf) {
-                            Err(nix::errno::Errno::EAGAIN) => {
-                                // SFD_NONBLOCK mode is set
-                                trace!("Err(nix::errno::Errno::EAGAIN) = read(pty.master), SFD_NONBLOCK flag is set");
-                            }
-                            Err(e) => {
-                                // error
-                                trace!("Err(e) = read(pty.master)");
-                                error!("pty.master read error");
-                                error!("{}", e);
-                            }
-                            Ok(0) => {
-                                // EOF
-                                trace!("Ok(0) = read(pty.master)");
-                            }
-                            Ok(n) => {
-                                // read n bytes
-                                trace!("Ok({n}) = read(pty.master)");
-                                trace!("utf8: {}", String::from_utf8_lossy(&buf[..n]));
-                                self.handler.handle_ptyin(&buf[..n]);
-                                // self.write_stdout(&buf[..n]);
-                            }
-                        }
-                    }
-
-                    trace!("check stdin events...");
-                    if let Some(nix::poll::PollFlags::POLLIN) = fds[2].revents() {
-                        trace!("read(stdin)");
-                        match read(stdin.as_raw_fd(), &mut buf) {
-                            Err(nix::errno::Errno::EAGAIN) => {
-                                // SFD_NONBLOCK mode is set
-                                trace!("Err(nix::errno::Errno::EAGAIN) = read(stdin), SFD_NONBLOCK flag is set");
-                            }
-                            Err(e) => {
-                                // error
-                                trace!("Err(e) = read(stdin)");
-                                error!("stdin read error");
-                                error!("{}", e);
-                            }
-                            Ok(0) => {
-                                // EOF
-                                trace!("Ok(0) = read(stdin)");
-                            }
-                            Ok(n) => {
-                                trace!("Ok({n}) = read(stdin)");
-                                trace!("utf8: {}", String::from_utf8_lossy(&buf[..n]));
-
-                                // self.write_pty(&buf[..n]);
-                                self.handler.handle_stdin(&buf[..n]);
-                            }
-                        }
-                    }
-                };
-
-                // Восстанавливаем исходные атрибуты терминала
-                termios.c_lflag = c_lflag;
-                termios.c_iflag = c_iflag;
-                termios.c_oflag = c_oflag;
-                termios.c_cflag = c_cflag;
-                termios.c_cc = c_cc;
-
-                trace!("termios resore: {:#?}", termios);
-                set_termios(stdin.as_raw_fd(), &mut termios)?;
-
-                status
-            }
+        match poll(&mut fds, PollTimeout::MAX) {
             Err(e) => {
-                error!(
-                    "{:?}: {:?}: Fork failed: {}",
-                    std::thread::current().id(),
-                    std::time::SystemTime::now(),
-                    e
-                );
-                Err(NixError::NixErrorno())
+                // error poll calling
+                error!("poll calling error: {}", e);
+                // break Err(e.into());
+                return Err(e.into())
+            }
+            Ok(0) => {
+                // timeout
+                trace!("poll timeout: Ok(0)");
+                is_timeout = true;
+            }
+            Ok(n) => {
+                // match n events
+                trace!("poll match {} events", n);
             }
         };
 
-        status
-    }
+        // trace!("fds: {:#?}", self.fds);
+        trace!("check child process {} is running...", self.child);
+        match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
+            Err(nix::errno::Errno::ECHILD) => {
+                error!(
+                    "the process {} is not a child of the process: {:?}",
+                    self.child,
+                    std::thread::current().id()
+                );
+                return Ok(false);
+            }
+            Err(nix::errno::Errno::EINTR) => {
+                error!("waitpid error: {}", nix::errno::Errno::EINTR);
+                return Err(UnixError::NixErrorno());
+            }
+            Err(e) => {
+                error!("waitpid error: {}", e);
+                return Err(e.into());
+            }
+            Ok(WaitStatus::Exited(pid, status)) => {
+                info!("WaitStatus::Exited(pid: {:?}, status: {:?}", pid, status);
+                if status != 0 {
+                    return Err(UnixError::ExitCodeError(status));
+                } else {
+                    return Ok(false);
+                }
+            }
+            Ok(WaitStatus::Signaled(pid, sig, _dumped)) => {
+                info!(
+                    "WaitStatus::Signaled(pid: {:?}, sig: {:?}, dumped: {:?})",
+                    pid, sig, _dumped
+                );
 
+                return Ok(false);
+            }
+            Ok(WaitStatus::Stopped(pid, sig)) => {
+                debug!("WaitStatus::Stopped(pid: {:?}, sig: {:?})", pid, sig);
+            }
+            Ok(WaitStatus::StillAlive) => {
+                trace!("WaitStatus::StillAlive");
+            }
+            Ok(WaitStatus::Continued(pid)) => {
+                trace!("WaitStatus::Continued(pid: {:?})", pid);
+            }
+            Ok(WaitStatus::PtraceEvent(pid, sig, c)) => {
+                trace!(
+                    "WaitStatus::PtraceEvent(pid: {:?}, sig: {:?}, c: {:?})",
+                    pid,
+                    sig,
+                    c
+                );
+            }
+            Ok(WaitStatus::PtraceSyscall(pid)) => {
+                trace!("WaitStatus::PtraceSyscall(pid: {:?})", pid);
+            }
+        }
+
+        if is_timeout {
+            return Ok(true);
+        }
+
+        trace!("check OS signal event...");
+        if let Some(nix::poll::PollFlags::POLLIN) = fds[0].revents() {
+            trace!("match OS signal: {:#?}", fds[0].revents());
+            match self.signal_fd.read_signal() {
+                Ok(Some(sig)) => {
+                    trace!("Some(res) = read_signal()");
+
+                    match Signal::try_from(sig.ssi_signo as i32) {
+                        Ok(Signal::SIGINT) => {
+                            info!("recv SIGINT");
+                            trace!("kill({}, SIGINT", self.child);
+                            if let Err(nix::errno::Errno::ESRCH) =
+                                kill(self.child, Signal::SIGINT)
+                            {
+                                error!("pid {} doesnt exists or zombie", self.child);
+                            }
+                        }
+                        Ok(Signal::SIGTERM) => {
+                            info!("recv SIGTERM");
+                            trace!("kill({}, SIGTERM", self.child);
+                            if let Err(nix::errno::Errno::ESRCH) =
+                                kill(self.child, Signal::SIGTERM)
+                            {
+                                error!("pid {} doesnt exists or zombie", self.child);
+                            }
+                        }
+                        Ok(Signal::SIGCHLD) => {
+                            info!("recv SIGCHLD");
+                        }
+                        Ok(Signal::SIGWINCH) => {
+                            info!("recv SIGWINCH");
+                            if let Ok(size) = get_termsize(self.stdin.as_raw_fd()) {
+                                trace!("set termsize: {:#?}", size);
+                                let res = set_termsize(self.pty.slave.as_raw_fd(), size);
+                                trace!("set_termsize: {:#?}", res);
+                            }
+                        }
+                        Ok(Signal::SIGSTOP) => {
+                            info!("recv SIGSTOP");
+                        }
+                        Ok(sig) => {
+                            info!("recv signal {}", sig);
+                        }
+                        Err(e) => {
+                            error!("recv unknown signal");
+                            error!("{e}");
+                        }
+                    }
+                }
+                Err(nix::errno::Errno::EAGAIN) => {
+                    trace!("Err(nix::errno::Errno::EAGAIN) = read_signal(), SFD_NONBLOCK flag is set");
+                }
+                Ok(None) => {
+                    trace!(
+                        "Ok(None) = read_signal(), SFD_NONBLOCK flag is set possible"
+                    );
+                }
+                Err(e) => {
+                    trace!("Err(e) = read_signal()");
+                    error!("{}", e);
+                }
+            }
+            trace!("read OS signal after");
+        }
+
+        trace!("check pty events...");
+        if let Some(nix::poll::PollFlags::POLLIN) = fds[1].revents() {
+            trace!("match pty event");
+            trace!("read(pty.master.as_raw_fd(), &mut buf[..])");
+
+            match read(self.pty.master.as_raw_fd(), &mut self.buf) {
+                Err(nix::errno::Errno::EAGAIN) => {
+                    // SFD_NONBLOCK mode is set
+                    trace!("Err(nix::errno::Errno::EAGAIN) = read(pty.master), SFD_NONBLOCK flag is set");
+                }
+                Err(e) => {
+                    // error
+                    trace!("Err(e) = read(pty.master)");
+                    error!("pty.master read error");
+                    error!("{}", e);
+                }
+                Ok(0) => {
+                    // EOF
+                    trace!("Ok(0) = read(pty.master)");
+                }
+                Ok(n) => {
+                    // read n bytes
+                    trace!("Ok({n}) = read(pty.master)");
+                    trace!("utf8: {}", String::from_utf8_lossy(&self.buf[..n]));
+                    // self.handler.handle_ptyin(&self.buf[..n]);
+                    self.write_stdout(&self.buf[..n]);
+                }
+            }
+        }
+
+        trace!("check stdin events...");
+        if let Some(nix::poll::PollFlags::POLLIN) = fds[2].revents() {
+            trace!("read(stdin)");
+            match read(self.stdin.as_raw_fd(), &mut self.buf) {
+                Err(nix::errno::Errno::EAGAIN) => {
+                    // SFD_NONBLOCK mode is set
+                    trace!("Err(nix::errno::Errno::EAGAIN) = read(stdin), SFD_NONBLOCK flag is set");
+                }
+                Err(e) => {
+                    // error
+                    trace!("Err(e) = read(stdin)");
+                    error!("stdin read error");
+                    error!("{}", e);
+                }
+                Ok(0) => {
+                    // EOF
+                    trace!("Ok(0) = read(stdin)");
+                }
+                Ok(n) => {
+                    trace!("Ok({n}) = read(stdin)");
+                    trace!("utf8: {}", String::from_utf8_lossy(&self.buf[..n]));
+
+                    self.write_pty(&self.buf[..n]);
+                    // self.handler.handle_stdin(&self.buf[..n]);
+                }
+            }
+        }
+
+        Ok(true)
+    }
 }

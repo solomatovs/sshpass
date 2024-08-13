@@ -4,11 +4,11 @@ use clap::{Arg, ArgGroup, Command};
 use log::{error, trace};
 
 mod app;
-use app::App;
+use app::SpecifiedApp;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::UnixTransport;
+use unix::UnixApp;
 
 fn cli() -> Command {
     let cmd = Command::new("sshpass")
@@ -165,13 +165,18 @@ fn main() {
     #[cfg(target_os = "linux")]
     {
         trace!("app ok, create unix app");
-        let mut app = App::new().unwrap();
-        let mut transport = UnixTransport::new(&mut app).unwrap();
-        let status = transport.run(args);
+        let mut unix_app = UnixApp::new(args).unwrap();
 
-        if let Err(e) = status {
-            error!("exit with error: {:?}", e);
-        }
+        loop {
+            match unix_app.process_event() {
+                Ok(false) => continue,
+                Ok(true) => break,
+                Err(e) => {
+                    error!("exit with error: {:?}", e);
+                    break;
+                }
+            }
+        };
     }
 }
 
