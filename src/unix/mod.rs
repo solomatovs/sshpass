@@ -162,14 +162,14 @@ pub enum FdsInfo<'fd> {
 
 pub struct Fds<'fd> {
     fds: Vec<FdsInfo<'fd>>,
-    poll_fds: Vec<PollFd<'fd>>,
+    poll_fds: RefCell<Vec<PollFd<'fd>>>,
 }
 
 impl Fds<'_> {
     pub fn new() -> Self {
         Self {
             fds: vec![],
-            poll_fds: vec![],
+            poll_fds: RefCell::new(vec![]),
         }
     }
 
@@ -190,7 +190,7 @@ impl Fds<'_> {
             pid: child,
             buf: &[0],
         });
-        self.poll_fds.push(res);
+        self.poll_fds.borrow_mut().push(res);
     }
 
     pub fn push_signal_fd(&mut self, signal_fd: SignalFd, events: PollFlags) {
@@ -204,7 +204,7 @@ impl Fds<'_> {
             fd: signal_fd,
             buf: &[0],
         });
-        self.poll_fds.push(res);
+        self.poll_fds.borrow_mut().push(res);
     }
 
     pub fn push_stdin_lock(&mut self, stdin: StdinLock<'static>, termios: Termios, events: PollFlags) {
@@ -219,7 +219,7 @@ impl Fds<'_> {
             termios: termios,
             buf: &[0],
         });
-        self.poll_fds.push(res);
+        self.poll_fds.borrow_mut().push(res);
     }
 
     pub fn remove_signal_fd(&mut self) {
@@ -238,7 +238,7 @@ impl Fds<'_> {
 
         for i in indexes {
             self.fds.remove(i);
-            self.poll_fds.remove(i);
+            self.poll_fds.borrow_mut().remove(i);
         }
     }
 }
@@ -266,7 +266,7 @@ impl UnixApp<'_> {
                 unsafe { nix::libc::ioctl(pty.slave.as_raw_fd(), nix::libc::TIOCSCTTY) };
                 // эта программа исполняется только в дочернем процессе
                 // родительский процесс в это же время выполняется и что то делает
-
+                
                 // lambda функция для перенаправления stdio
                 let new_follower_stdio = || unsafe { Stdio::from_raw_fd(pty.slave.as_raw_fd()) };
 
@@ -600,8 +600,8 @@ impl From<nix::errno::Errno> for UnixEvent<'_> {
 // }
 
 
-impl<'a> NativeApp<'a, UnixEvent<'a>> for UnixApp<'a> {
-    fn poll(&'a self, timeout: i32) -> UnixEvent<'a> {
+impl<'a, 'b> NativeApp<UnixEvent<'a>> for UnixApp<'b> {
+    fn poll(&self, timeout: i32) -> UnixEvent<'a> {
         
         let mut is_timeout = false;
         let timeout = match timeout {
@@ -613,13 +613,15 @@ impl<'a> NativeApp<'a, UnixEvent<'a>> for UnixApp<'a> {
         trace!("poll(&mut fds, {:?})", timeout);
 
         // набор файловых указателей, которые будут обработаны poll
-        let mut fds = [
-            // PollFd::new(self.signal_fd.as_fd(), PollFlags::POLLIN),
-            // PollFd::new(self.pty.master.as_fd(), PollFlags::POLLIN),
-            // PollFd::new(self.stdin.as_fd(), PollFlags::POLLIN),
-        ];
+        // let mut fds = [
+        //     // PollFd::new(self.signal_fd.as_fd(), PollFlags::POLLIN),
+        //     // PollFd::new(self.pty.master.as_fd(), PollFlags::POLLIN),
+        //     // PollFd::new(self.stdin.as_fd(), PollFlags::POLLIN),
+        // ];
 
-        match poll(&mut fds, timeout) {
+        let mut fds = self.fds.poll_fds.borrow_mut();
+        let fds = fds.as_mut_slice();
+        match poll(fds, timeout) {
             Err(e) => {
                 error!("poll calling error: {}", e);
                 return e.into()

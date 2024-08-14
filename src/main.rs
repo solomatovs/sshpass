@@ -166,7 +166,6 @@ fn main() {
     let status = {
         trace!("app ok, create unix app");
         let app = UnixApp::new(args).unwrap();
-
         loop {
             let ref_p = app.poll(-1);
             match ref_p {
@@ -191,10 +190,10 @@ fn main() {
                     trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
                 },
                 UnixEvent::Ptyin(buf, num) => {
-                    app.write_stdout(&buf.borrow()[..num]);
+                    // app.write_stdout(&buf.borrow()[..num]);
                 },
                 UnixEvent::Stdin(buf, num) => {
-                    app.write_pty(&buf.borrow()[..num]);
+                    // app.write_pty(&buf.borrow()[..num]);
                 },
             }
 
@@ -202,7 +201,7 @@ fn main() {
         }
     };
 
-    std::process::exit(status);
+    std::process::exit(0);
 }
 
 fn _strip_nl(s: &mut String) -> String {
