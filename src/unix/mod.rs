@@ -11,7 +11,7 @@ use log::{debug, error, info, trace};
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::signalfd::{SignalFd, SfdFlags};
-use nix::errno::Errno::{EINTR, ECHILD};
+use nix::errno::Errno::{EINTR, ECHILD, EAGAIN, ESRCH};
 use nix::{
     poll::{poll, PollFd, PollFlags, PollTimeout},
     unistd::{read, write},
@@ -25,7 +25,7 @@ use termios::{
 
 use clap::ArgMatches;
 
-use crate::app::SpecifiedApp;
+use crate::app::NativeApp;
 
 
 // Флаг          Значение
@@ -120,7 +120,7 @@ impl UnixApp {
                 // родительский процесс в это же время выполняется и что то делает
 
                 let program = args.get_one::<String>("program").unwrap();
-                let args = args.get_many::<String>("program_args").unwrap();
+                let args = args.get_many::<String>("program_args");
 
                 // lambda функция для перенаправления stdio
                 let new_follower_stdio =
@@ -130,8 +130,12 @@ impl UnixApp {
                 // это означает что дочерний процесс не будет еще раз разделятся
                 // Command будет выполняться под pid этого дочернего процесса и буквально станет им
                 // осуществляется всё это с помощью exec()
-                let e = std::process::Command::new(program)
-                    .args(args)
+                let mut cmd = std::process::Command::new(program);
+                if args.is_some() {
+                    cmd.args(args.unwrap());
+                }
+
+                let e = cmd
                     .stdin(new_follower_stdio())
                     .stdout(new_follower_stdio())
                     .stderr(new_follower_stdio())
@@ -211,6 +215,179 @@ impl UnixApp {
         // drop(self.child.as_raw());
 
         Ok(())
+    }
+
+
+    fn waitpid(&self) -> Option<UnixEvent> {
+        trace!("check child process {} is running...", self.child);
+        match waitpid(self.child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WSTOPPED | WaitPidFlag::WCONTINUED | WaitPidFlag::WUNTRACED)) {
+            Err(e) => {
+                error!("waitpid error: {}", e);
+                return Some(e.into())
+            }
+            Ok(WaitStatus::Exited(pid, status)) => {
+                info!("WaitStatus::Exited(pid: {:?}, status: {:?}", pid, status);
+                return Some(UnixEvent::ChildExited(pid, status));
+            }
+            Ok(WaitStatus::Signaled(pid, sig, _dumped)) => {
+                info!(
+                    "WaitStatus::Signaled(pid: {:?}, sig: {:?}, dumped: {:?})",
+                    pid, sig, _dumped
+                );
+
+                return Some(UnixEvent::ChildSignaled(pid, sig, _dumped));
+            }
+            Ok(WaitStatus::Stopped(pid, sig)) => {
+                debug!("WaitStatus::Stopped(pid: {:?}, sig: {:?})", pid, sig);
+            }
+            Ok(WaitStatus::StillAlive) => {
+                trace!("WaitStatus::StillAlive");
+            }
+            Ok(WaitStatus::Continued(pid)) => {
+                trace!("WaitStatus::Continued(pid: {:?})", pid);
+            }
+            Ok(WaitStatus::PtraceEvent(pid, sig, c)) => {
+                trace!(
+                    "WaitStatus::PtraceEvent(pid: {:?}, sig: {:?}, c: {:?})",
+                    pid,
+                    sig,
+                    c
+                );
+            }
+            Ok(WaitStatus::PtraceSyscall(pid)) => {
+                trace!("WaitStatus::PtraceSyscall(pid: {:?})", pid);
+            }
+        }
+
+        None
+    }
+
+    fn signal_event(&self) -> Option<UnixEvent> {
+        match self.signal_fd.read_signal() {
+            Ok(Some(sig)) => {
+                trace!("Some(res) = read_signal()");
+
+                match Signal::try_from(sig.ssi_signo as i32) {
+                    Ok(Signal::SIGINT) => {
+                        info!("recv SIGINT");
+                        trace!("kill({}, SIGINT", self.child);
+                        if let Err(ESRCH) = kill(self.child, Signal::SIGINT)
+                        {
+                            error!("pid {} doesnt exists or zombie", self.child);
+                        }
+                    }
+                    Ok(Signal::SIGTERM) => {
+                        info!("recv SIGTERM");
+                        trace!("kill({}, SIGTERM", self.child);
+                        if let Err(ESRCH) = kill(self.child, Signal::SIGTERM)
+                        {
+                            error!("pid {} doesnt exists or zombie", self.child);
+                        }
+                    }
+                    Ok(Signal::SIGCHLD) => {
+                        info!("recv SIGCHLD");
+                        return self.waitpid();
+                    }
+                    Ok(Signal::SIGWINCH) => {
+                        info!("recv SIGWINCH");
+                        if let Ok(size) = get_termsize(self.stdin.as_raw_fd()) {
+                            trace!("set termsize: {:#?}", size);
+                            let res = set_termsize(self.pty.slave.as_raw_fd(), size);
+                            trace!("set_termsize: {:#?}", res);
+                        }
+                    }
+                    Ok(Signal::SIGSTOP) => {
+                        info!("recv SIGSTOP");
+                    }
+                    Ok(sig) => {
+                        info!("recv signal {}", sig);
+                    }
+                    Err(e) => {
+                        error!("recv unknown signal");
+                        error!("{e}");
+                    }
+                }
+            }
+            Err(EAGAIN) => {
+                trace!("Err(nix::errno::Errno::EAGAIN) = read_signal(), SFD_NONBLOCK flag is set");
+            }
+            Ok(None) => {
+                trace!(
+                    "Ok(None) = read_signal(), SFD_NONBLOCK flag is set possible"
+                );
+            }
+            Err(e) => {
+                trace!("Err(e) = read_signal()");
+                error!("{}", e);
+            }
+        }
+
+        None
+    }
+
+    fn pty_event(&self) -> Option<UnixEvent> {
+        trace!("read(pty.master.as_raw_fd(), &mut buf[..])");
+
+        let res = {
+            read(self.pty.master.as_raw_fd(), self.buf.borrow_mut().as_mut())
+        };
+        match res {
+            Err(EAGAIN) => {
+                // SFD_NONBLOCK mode is set
+                trace!("Err(nix::errno::Errno::EAGAIN) = read(pty.master), SFD_NONBLOCK flag is set");
+            }
+            Err(e) => {
+                // error
+                trace!("Err(e) = read(pty.master)");
+                error!("pty.master read error");
+                error!("{}", e);
+            }
+            Ok(0) => {
+                // EOF
+                trace!("Ok(0) = read(pty.master)");
+            }
+            Ok(n) => {
+                // read n bytes
+                trace!("Ok({n}) = read(pty.master)");
+                trace!("utf8: {}", String::from_utf8_lossy(&self.buf.borrow()[..n]));
+                return Some(UnixEvent::Ptyin(self.buf.borrow(), n));
+            }
+        }
+
+        None
+    }
+
+    fn stdin_event(&self) -> Option<UnixEvent> {
+        trace!("read(stdin)");
+        let res = {
+            read(self.stdin.as_raw_fd(), self.buf.borrow_mut().as_mut())
+        };
+        match res {
+            Err(nix::errno::Errno::EAGAIN) => {
+                // SFD_NONBLOCK mode is set
+                trace!("Err(nix::errno::Errno::EAGAIN) = read(stdin), SFD_NONBLOCK flag is set");
+            }
+            Err(e) => {
+                // error
+                trace!("Err(e) = read(stdin)");
+                error!("stdin read error");
+                error!("{}", e);
+            }
+            Ok(0) => {
+                // EOF
+                trace!("Ok(0) = read(stdin)");
+            }
+            Ok(n) => {
+                trace!("Ok({n}) = read(stdin)");
+                trace!("utf8: {}", String::from_utf8_lossy(&self.buf.borrow()[..n]));
+
+                return Some(UnixEvent::Stdin(self.buf.borrow(), n));
+                // self.write_pty(&self.buf[..n]);
+                // self.handler.handle_stdin(&self.buf[..n]);
+            }
+        }
+
+        None
     }
 }
 
@@ -303,8 +480,9 @@ impl From<i32> for UnixError {
     }
 }
 
-impl<'a> SpecifiedApp<'a, UnixEvent<'a>> for UnixApp {
+impl<'a> NativeApp<'a, UnixEvent<'a>> for UnixApp {
     fn poll(&'a self, timeout: i32) -> UnixEvent<'a> {
+        
         let mut is_timeout = false;
         let timeout = match timeout {
             -1 => PollTimeout::NONE,
@@ -323,9 +501,7 @@ impl<'a> SpecifiedApp<'a, UnixEvent<'a>> for UnixApp {
 
         match poll(&mut fds, timeout) {
             Err(e) => {
-                // error poll calling
                 error!("poll calling error: {}", e);
-                // break Err(e.into());
                 return e.into()
             }
             Ok(0) => {
@@ -339,194 +515,35 @@ impl<'a> SpecifiedApp<'a, UnixEvent<'a>> for UnixApp {
             }
         };
 
-        // trace!("fds: {:#?}", self.fds);
-        trace!("check child process {} is running...", self.child);
-        match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
-            Err(ECHILD) => {
-                error!(
-                    "the process {} is not a child of the process: {:?}",
-                    self.child,
-                    std::thread::current().id()
-                );
-                return UnixEvent::NixErrorno(ECHILD);
-            }
-            Err(EINTR) => {
-                error!("waitpid error: {}", EINTR);
-                return UnixEvent::NixErrorno(EINTR);
-            }
-            Err(e) => {
-                error!("waitpid error: {}", e);
-                return e.into()
-            }
-            Ok(WaitStatus::Exited(pid, status)) => {
-                info!("WaitStatus::Exited(pid: {:?}, status: {:?}", pid, status);
-                return UnixEvent::ChildExited(pid, status);
-            }
-            Ok(WaitStatus::Signaled(pid, sig, _dumped)) => {
-                info!(
-                    "WaitStatus::Signaled(pid: {:?}, sig: {:?}, dumped: {:?})",
-                    pid, sig, _dumped
-                );
-
-                return UnixEvent::ChildSignaled(pid, sig, _dumped);
-            }
-            Ok(WaitStatus::Stopped(pid, sig)) => {
-                debug!("WaitStatus::Stopped(pid: {:?}, sig: {:?})", pid, sig);
-            }
-            Ok(WaitStatus::StillAlive) => {
-                trace!("WaitStatus::StillAlive");
-            }
-            Ok(WaitStatus::Continued(pid)) => {
-                trace!("WaitStatus::Continued(pid: {:?})", pid);
-            }
-            Ok(WaitStatus::PtraceEvent(pid, sig, c)) => {
-                trace!(
-                    "WaitStatus::PtraceEvent(pid: {:?}, sig: {:?}, c: {:?})",
-                    pid,
-                    sig,
-                    c
-                );
-            }
-            Ok(WaitStatus::PtraceSyscall(pid)) => {
-                trace!("WaitStatus::PtraceSyscall(pid: {:?})", pid);
-            }
-        }
+        // trace!("fds: {:#?}", fds);
 
         if is_timeout {
             return UnixEvent::Timeout;
         }
 
         trace!("check OS signal event...");
-        if let Some(PollFlags::POLLIN) = fds[0].revents() {
-            trace!("match OS signal: {:#?}", fds[0].revents());
-            match self.signal_fd.read_signal() {
-                Ok(Some(sig)) => {
-                    trace!("Some(res) = read_signal()");
-
-                    match Signal::try_from(sig.ssi_signo as i32) {
-                        Ok(Signal::SIGINT) => {
-                            info!("recv SIGINT");
-                            trace!("kill({}, SIGINT", self.child);
-                            if let Err(nix::errno::Errno::ESRCH) =
-                                kill(self.child, Signal::SIGINT)
-                            {
-                                error!("pid {} doesnt exists or zombie", self.child);
-                            }
-                        }
-                        Ok(Signal::SIGTERM) => {
-                            info!("recv SIGTERM");
-                            trace!("kill({}, SIGTERM", self.child);
-                            if let Err(nix::errno::Errno::ESRCH) =
-                                kill(self.child, Signal::SIGTERM)
-                            {
-                                error!("pid {} doesnt exists or zombie", self.child);
-                            }
-                        }
-                        Ok(Signal::SIGCHLD) => {
-                            info!("recv SIGCHLD");
-                        }
-                        Ok(Signal::SIGWINCH) => {
-                            info!("recv SIGWINCH");
-                            if let Ok(size) = get_termsize(self.stdin.as_raw_fd()) {
-                                trace!("set termsize: {:#?}", size);
-                                let res = set_termsize(self.pty.slave.as_raw_fd(), size);
-                                trace!("set_termsize: {:#?}", res);
-                            }
-                        }
-                        Ok(Signal::SIGSTOP) => {
-                            info!("recv SIGSTOP");
-                        }
-                        Ok(sig) => {
-                            info!("recv signal {}", sig);
-                        }
-                        Err(e) => {
-                            error!("recv unknown signal");
-                            error!("{e}");
-                        }
-                    }
-                }
-                Err(nix::errno::Errno::EAGAIN) => {
-                    trace!("Err(nix::errno::Errno::EAGAIN) = read_signal(), SFD_NONBLOCK flag is set");
-                }
-                Ok(None) => {
-                    trace!(
-                        "Ok(None) = read_signal(), SFD_NONBLOCK flag is set possible"
-                    );
-                }
-                Err(e) => {
-                    trace!("Err(e) = read_signal()");
-                    error!("{}", e);
-                }
-            }
-            trace!("read OS signal after");
-        }
+        let os_event = if let Some(PollFlags::POLLIN) = fds[0].revents() {
+            trace!("match OS signal");
+            self.signal_event()
+        } else {
+            None
+        };
 
         trace!("check pty events...");
-        if let Some(PollFlags::POLLIN) = fds[1].revents() {
+        let pty_event = if let Some(PollFlags::POLLIN) = fds[1].revents() {
             trace!("match pty event");
-            trace!("read(pty.master.as_raw_fd(), &mut buf[..])");
-
-            let res = {
-                read(self.pty.master.as_raw_fd(), self.buf.borrow_mut().as_mut())
-            };
-            match res {
-                Err(nix::errno::Errno::EAGAIN) => {
-                    // SFD_NONBLOCK mode is set
-                    trace!("Err(nix::errno::Errno::EAGAIN) = read(pty.master), SFD_NONBLOCK flag is set");
-                }
-                Err(e) => {
-                    // error
-                    trace!("Err(e) = read(pty.master)");
-                    error!("pty.master read error");
-                    error!("{}", e);
-                }
-                Ok(0) => {
-                    // EOF
-                    trace!("Ok(0) = read(pty.master)");
-                }
-                Ok(n) => {
-                    // read n bytes
-                    trace!("Ok({n}) = read(pty.master)");
-                    trace!("utf8: {}", String::from_utf8_lossy(&self.buf.borrow()[..n]));
-                    // self.handler.handle_ptyin(&self.buf[..n]);
-                    // let sdf = self.buf.as_ptr();
-                    return UnixEvent::Ptyin(self.buf.borrow(), n);
-                    // self.write_stdout(&self.buf[..n]);
-                }
-            }
-        }
+            self.pty_event()
+        } else {
+            None
+        };
 
         trace!("check stdin events...");
-        if let Some(PollFlags::POLLIN) = fds[2].revents() {
-            trace!("read(stdin)");
-            let res = {
-                read(self.stdin.as_raw_fd(), self.buf.borrow_mut().as_mut())
-            };
-            match res {
-                Err(nix::errno::Errno::EAGAIN) => {
-                    // SFD_NONBLOCK mode is set
-                    trace!("Err(nix::errno::Errno::EAGAIN) = read(stdin), SFD_NONBLOCK flag is set");
-                }
-                Err(e) => {
-                    // error
-                    trace!("Err(e) = read(stdin)");
-                    error!("stdin read error");
-                    error!("{}", e);
-                }
-                Ok(0) => {
-                    // EOF
-                    trace!("Ok(0) = read(stdin)");
-                }
-                Ok(n) => {
-                    trace!("Ok({n}) = read(stdin)");
-                    trace!("utf8: {}", String::from_utf8_lossy(&self.buf.borrow()[..n]));
-
-                    return UnixEvent::Stdin(self.buf.borrow(), n);
-                    // self.write_pty(&self.buf[..n]);
-                    // self.handler.handle_stdin(&self.buf[..n]);
-                }
-            }
-        }
+        let stdin_event = if let Some(PollFlags::POLLIN) = fds[2].revents() {
+            trace!("match stdin event");
+            self.stdin_event()
+        } else {
+            None
+        };
 
         UnixEvent::EventNotCapture
     }
@@ -555,4 +572,3 @@ impl<'a> SpecifiedApp<'a, UnixEvent<'a>> for UnixApp {
         }
     }
 }
-

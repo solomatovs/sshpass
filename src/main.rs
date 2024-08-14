@@ -1,10 +1,10 @@
 use std::{borrow::Borrow, str::FromStr};
 
 use clap::{Arg, ArgGroup, Command};
-use log::{error, trace};
+use log::trace;
 
 mod app;
-use app::SpecifiedApp;
+use app::NativeApp;
 
 #[cfg(target_os = "linux")]
 mod unix;
@@ -163,40 +163,46 @@ fn main() {
     trace!("mach arguments {:#?}", args);
 
     #[cfg(target_os = "linux")]
-    {
+    let status = {
         trace!("app ok, create unix app");
-        let mut unix_app = UnixApp::new(args).unwrap();
+        let app = UnixApp::new(args).unwrap();
 
         loop {
-            let ref_p = unix_app.poll(-1);
+            let ref_p = app.poll(-1);
             match ref_p {
                 UnixEvent::EventNotCapture => {},
-                UnixEvent::Timeout => {},
-                UnixEvent::NixErrorno(e) => {
-                    break;
+                UnixEvent::Timeout => {
+                    trace!("poll timeout");
                 },
-                UnixEvent::StdIoError(e) => {
-                    break;
+                UnixEvent::NixErrorno(_e) => {
+                    // break -1;
+                    trace!("nix error: {:#?}", _e);
                 },
-                UnixEvent::ChildExited(pid, status) => {
-                    break;
+                UnixEvent::StdIoError(_e) => {
+                    // break -1;
+                    trace!("std error: {:#?}", _e);
                 },
-                UnixEvent::ChildSignaled(pid, signal, dumped) => {
-                    break;
+                UnixEvent::ChildExited(_pid, status) => {
+                    // break status;
+                    trace!("child {} exit: {}", _pid, status);
+                },
+                UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
+                    // break 0;
+                    trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
                 },
                 UnixEvent::Ptyin(buf, num) => {
-                    // unix_app.write_stdout(buf);
-                    unix_app.write_stdout(&buf.borrow()[..num]);
-                    // trace!("buf: {:#?}", buf);
-
+                    app.write_stdout(&buf.borrow()[..num]);
                 },
                 UnixEvent::Stdin(buf, num) => {
-                    unix_app.write_pty(&buf.borrow()[..num]);
-                    // trace!("buf: {:#?}", buf);
+                    app.write_pty(&buf.borrow()[..num]);
                 },
             }
-        };
-    }
+
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    };
+
+    std::process::exit(status);
 }
 
 fn _strip_nl(s: &mut String) -> String {

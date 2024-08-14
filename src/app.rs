@@ -1,4 +1,4 @@
-pub trait SpecifiedApp<'a, R> {
+pub trait NativeApp<'a, R> {
     fn poll(&'a self, timeout: i32) -> R;
     fn write_stdout(&'a self, buf: &'a [u8]);
     fn write_pty(&'a self, buf: &'a [u8]);
