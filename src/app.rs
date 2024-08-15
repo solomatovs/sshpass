@@ -1,5 +1,5 @@
 pub trait NativeApp<R> {
-    fn poll(&self, timeout: i32) -> R;
+    fn poll(&mut self, timeout: i32) -> R;
     fn write_stdout(&self, buf: &[u8]);
     fn write_pty(&self, buf: &[u8]);
 }

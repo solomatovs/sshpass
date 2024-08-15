@@ -162,20 +162,46 @@ pub enum FdsInfo<'fd> {
 
 pub struct Fds<'fd> {
     fds: Vec<FdsInfo<'fd>>,
-    poll_fds: RefCell<Vec<PollFd<'fd>>>,
+    poll_fds: Vec<PollFd<'fd>>,
 }
 
-impl Fds<'_> {
+pub struct FdsIterator<'a, 'b> {
+    todos: &'b Fds<'a>,
+    index: usize,
+}
+
+impl<'a, 'b> Iterator for FdsIterator<'a, 'b> {
+    type Item = &'b FdsInfo<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.todos.fds.len() {
+            let result = Some(&self.todos.fds[self.index]);
+            self.index += 1;
+            result
+        } else {
+            None
+        }
+    }
+}
+
+impl<'fd> Fds<'fd> {
     pub fn new() -> Self {
         Self {
             fds: vec![],
-            poll_fds: RefCell::new(vec![]),
+            poll_fds: vec![],
         }
     }
 
-    pub fn get_mut_poll_fd(&mut self) -> &mut [PollFd] {
-        todo!();
-        // self.poll_fds.as_mut()
+    pub fn iter<'b>(&'b self) -> FdsIterator<'fd, 'b> {
+        FdsIterator {
+            todos: self,
+            index: 0,
+        }
+    }
+
+    pub fn get_mut_poll_fd(&mut self) -> &[PollFd] {
+        // todo!();
+        &self.poll_fds
     }
 
     pub fn push_pty_fd(&mut self, pty_fd: OpenptyResult, child: Pid, events: PollFlags) {
@@ -190,7 +216,7 @@ impl Fds<'_> {
             pid: child,
             buf: &[0],
         });
-        self.poll_fds.borrow_mut().push(res);
+        self.poll_fds.push(res);
     }
 
     pub fn push_signal_fd(&mut self, signal_fd: SignalFd, events: PollFlags) {
@@ -204,7 +230,7 @@ impl Fds<'_> {
             fd: signal_fd,
             buf: &[0],
         });
-        self.poll_fds.borrow_mut().push(res);
+        self.poll_fds.push(res);
     }
 
     pub fn push_stdin_lock(&mut self, stdin: StdinLock<'static>, termios: Termios, events: PollFlags) {
@@ -219,7 +245,7 @@ impl Fds<'_> {
             termios: termios,
             buf: &[0],
         });
-        self.poll_fds.borrow_mut().push(res);
+        self.poll_fds.push(res);
     }
 
     pub fn remove_signal_fd(&mut self) {
@@ -238,7 +264,7 @@ impl Fds<'_> {
 
         for i in indexes {
             self.fds.remove(i);
-            self.poll_fds.borrow_mut().remove(i);
+            self.poll_fds.remove(i);
         }
     }
 }
@@ -601,7 +627,7 @@ impl From<nix::errno::Errno> for UnixEvent<'_> {
 
 
 impl<'a, 'b> NativeApp<UnixEvent<'a>> for UnixApp<'b> {
-    fn poll(&self, timeout: i32) -> UnixEvent<'a> {
+    fn poll(&mut self, timeout: i32) -> UnixEvent<'a> {
         
         let mut is_timeout = false;
         let timeout = match timeout {
@@ -619,8 +645,9 @@ impl<'a, 'b> NativeApp<UnixEvent<'a>> for UnixApp<'b> {
         //     // PollFd::new(self.stdin.as_fd(), PollFlags::POLLIN),
         // ];
 
-        let mut fds = self.fds.poll_fds.borrow_mut();
-        let fds = fds.as_mut_slice();
+        // let mut fds = self.fds.poll_fds.borrow_mut();
+        // let fds = fds.as_mut_slice();
+        let fds = self.fds.poll_fds.as_mut();
         match poll(fds, timeout) {
             Err(e) => {
                 error!("poll calling error: {}", e);
@@ -641,6 +668,10 @@ impl<'a, 'b> NativeApp<UnixEvent<'a>> for UnixApp<'b> {
 
         if is_timeout {
             return UnixEvent::Timeout;
+        }
+
+        for fd in self.fds.iter() {
+
         }
 
         // trace!("check OS signal event...");

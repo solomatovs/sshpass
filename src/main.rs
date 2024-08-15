@@ -165,7 +165,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     let status = {
         trace!("app ok, create unix app");
-        let app = UnixApp::new(args).unwrap();
+        let mut app = UnixApp::new(args).unwrap();
         loop {
             let ref_p = app.poll(-1);
             match ref_p {
