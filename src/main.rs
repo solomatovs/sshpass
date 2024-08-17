@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, str::FromStr};
+use std::str::FromStr;
 
 use clap::{Arg, ArgGroup, Command};
 use log::trace;
@@ -168,35 +168,48 @@ fn main() {
         let mut app = UnixApp::new(args).unwrap();
         loop {
             let ref_p = app.poll(-1);
-            match ref_p {
-                UnixEvent::EventNotCapture => {},
-                UnixEvent::Timeout => {
-                    trace!("poll timeout");
-                },
-                UnixEvent::NixErrorno(_e) => {
-                    // break -1;
-                    trace!("nix error: {:#?}", _e);
-                },
-                UnixEvent::StdIoError(_e) => {
-                    // break -1;
-                    trace!("std error: {:#?}", _e);
-                },
-                UnixEvent::ChildExited(_pid, status) => {
-                    // break status;
-                    trace!("child {} exit: {}", _pid, status);
-                },
-                UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
-                    // break 0;
-                    trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
-                },
-                UnixEvent::Ptyin(buf, num) => {
-                    // app.write_stdout(&buf.borrow()[..num]);
-                },
-                UnixEvent::Stdin(buf, num) => {
-                    // app.write_pty(&buf.borrow()[..num]);
-                },
+            {
+                match ref_p {
+                    UnixEvent::EventNotCapture => {}
+                    UnixEvent::Timeout => {
+                        trace!("poll timeout");
+                    }
+                    UnixEvent::NixErrorno(_e) => {
+                        // break -1;
+                        trace!("nix error: {:#?}", _e);
+                    }
+                    UnixEvent::StdIoError(_e) => {
+                        // break -1;
+                        trace!("std error: {:#?}", _e);
+                    }
+                    UnixEvent::ChildExited(_pid, status) => {
+                        // break status;
+                        trace!("child {} exit: {}", _pid, status);
+                    }
+                    UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
+                        // break 0;
+                        trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
+                    }
+                    UnixEvent::Ptyin(buf) => {
+                        trace!("Pty {:?}", buf);
+                    }
+                    UnixEvent::Stdin(buf) => {
+                        trace!("Stdin {:?}", buf);
+                    }
+                    UnixEvent::SignalChildStatus(sig) => {
+                        trace!("SIGCHLD {:?}", sig);
+                    }
+                    UnixEvent::SignalStop(sig) => {
+                        trace!("SIGSTP {:?}", sig);
+                    }
+                    UnixEvent::SignalToResize(sig) => {
+                        trace!("SIGWINCH {:?}", sig);
+                    }
+                    UnixEvent::SignalToShutdown(sig) => {
+                        trace!("SIGINT {:?}", sig);
+                    }
+                }
             }
-
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     };

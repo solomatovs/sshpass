@@ -1,5 +1,5 @@
-pub trait NativeApp<R> {
-    fn poll(&mut self, timeout: i32) -> R;
+pub trait NativeApp<'a, R: 'a> {
+    fn poll(&'a self, timeout: i32) -> R;
     fn write_stdout(&self, buf: &[u8]);
     fn write_pty(&self, buf: &[u8]);
 }
@@ -15,7 +15,7 @@ pub trait NativeApp<R> {
 // impl<E: std::error::Error> App<E> {}
 
 // impl<T, E> MainApp for App<E>
-// where 
+// where
 //     T: Fn(&dyn MainApp, &[u8]),
 //     E: std::error::Error
 // {
