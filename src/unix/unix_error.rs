@@ -3,16 +3,10 @@ use std::fmt;
 #[derive(Debug)]
 pub enum UnixError {
     StdIoError(std::io::Error),
-
-    NixErrorno(),
-
-    // ArgumentError(String),
-    ExitCodeError(i32),
-    // Ok,
-
-    // ShutdownSendError,
-
-    // ChildTerminatedBySignal,
+    NixErrorno(nix::errno::Errno),
+    PollEventNotHandle,
+    // FdReadOnly,
+    // FdNotFound,
 }
 
 impl fmt::Display for UnixError {
@@ -30,13 +24,9 @@ impl From<std::io::Error> for UnixError {
 }
 
 impl From<nix::errno::Errno> for UnixError {
-    fn from(_: nix::errno::Errno) -> Self {
-        UnixError::NixErrorno()
+    fn from(e: nix::errno::Errno) -> Self {
+        UnixError::NixErrorno(e)
     }
 }
 
-impl From<i32> for UnixError {
-    fn from(error: i32) -> Self {
-        UnixError::ExitCodeError(error)
-    }
-}
+

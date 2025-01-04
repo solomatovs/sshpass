@@ -1,17 +1,17 @@
-use std::str::FromStr;
 
+use std::str::FromStr;
+use nix::sys::signal::Signal;
 use clap::{Arg, ArgGroup, Command};
-use log::trace;
+use log::{trace, error};
 
 mod app;
-use app::NativeApp;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::{UnixApp, UnixEvent};
+use unix::{UnixApp, UnixEvent, UnixError};
 
 fn cli() -> Command {
-    let cmd = Command::new("sshpass")
+    Command::new("sshpass")
         .version("1.0")
         .about("Non-interactive ssh password provider")
         .arg(
@@ -135,9 +135,7 @@ fn cli() -> Command {
                 .num_args(1..)
                 .allow_hyphen_values(true)
                 .trailing_var_arg(true),
-        );
-
-    cmd
+        )
 }
 
 fn main() {
@@ -151,7 +149,7 @@ fn main() {
             .set_max_level(level)
             .build();
 
-        let _ = simplelog::CombinedLogger::init(vec![simplelog::WriteLogger::new(
+        simplelog::CombinedLogger::init(vec![simplelog::WriteLogger::new(
             level,
             config,
             std::fs::File::create("sshpass.log").unwrap(),
@@ -167,54 +165,55 @@ fn main() {
         trace!("app ok, create unix app");
         let mut app = UnixApp::new(args).unwrap();
         loop {
-            let ref_p = app.poll(-1);
             {
-                match ref_p {
-                    UnixEvent::EventNotCapture => {}
-                    UnixEvent::Timeout => {
-                        trace!("poll timeout");
+                match app.system_event() {
+                    Ok(res) => match res {
+                        UnixEvent::PollTimeout => {
+                            trace!("poll timeout");
+                        }
+                        // UnixEvent::ChildExited(_pid, status) => {
+                        //     trace!("child {} exit: {}", _pid, status);
+                        // }
+                        // UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
+                        //     trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
+                        // }
+                        UnixEvent::PtyMaster(buf) => {
+                            trace!("pty utf8: {}", String::from_utf8_lossy(buf.trim_ascii()));
+                            // app.send_to(0, buf);
+                        }
+                        UnixEvent::Stdin(buf) => {
+                            trace!("stdin utf8: {}", String::from_utf8_lossy(buf.trim_ascii()));
+                        }
+                        UnixEvent::Signal(sig, _sigino) => {
+                            trace!("signal {:#?}", sig);
+                            // trace!("signal info {:#?}", sigino);
+                            if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
+                                break 0;
+                            }
+                        }
+                        UnixEvent::ReadZeroBytes => {
+                            trace!("read zero bytes");
+                        }
                     }
-                    UnixEvent::NixErrorno(_e) => {
-                        // break -1;
-                        trace!("nix error: {:#?}", _e);
+                    Err(UnixError::StdIoError(ref e)) => {
+                        error!("IO Error: {}", e);
+                        break 1;
                     }
-                    UnixEvent::StdIoError(_e) => {
-                        // break -1;
-                        trace!("std error: {:#?}", _e);
+                    Err(UnixError::NixErrorno(ref e)) => {
+                        error!("Nix Error: {}", e);
+                        break 2;
                     }
-                    UnixEvent::ChildExited(_pid, status) => {
-                        // break status;
-                        trace!("child {} exit: {}", _pid, status);
+                    Err(UnixError::PollEventNotHandle) => {
+                        error!("the poll reported the event");
+                        error!("However, the event was not read through the handlers");
+                        break 3;
                     }
-                    UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
-                        // break 0;
-                        trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
-                    }
-                    UnixEvent::Ptyin(buf) => {
-                        trace!("Pty {:?}", buf);
-                    }
-                    UnixEvent::Stdin(buf) => {
-                        trace!("Stdin {:?}", buf);
-                    }
-                    UnixEvent::SignalChildStatus(sig) => {
-                        trace!("SIGCHLD {:?}", sig);
-                    }
-                    UnixEvent::SignalStop(sig) => {
-                        trace!("SIGSTP {:?}", sig);
-                    }
-                    UnixEvent::SignalToResize(sig) => {
-                        trace!("SIGWINCH {:?}", sig);
-                    }
-                    UnixEvent::SignalToShutdown(sig) => {
-                        trace!("SIGINT {:?}", sig);
-                    }
-                }
+                }    
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     };
 
-    std::process::exit(0);
+    std::process::exit(status);
 }
 
 fn _strip_nl(s: &mut String) -> String {

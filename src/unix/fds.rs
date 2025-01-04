@@ -1,94 +1,55 @@
-use std::borrow::BorrowMut;
-use std::boxed::Box;
-use std::cell::{Ref, RefCell, RefMut};
-use std::io::{Stdin, StdinLock, Write};
-use std::os::fd::BorrowedFd;
-use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
-use std::os::unix::process::CommandExt;
-use std::process::Stdio;
-use std::rc::Rc;
+use std::io::Stdin;
+use std::os::unix::io::AsRawFd;
 
-use clap::parser::ValuesRef;
-use nix::errno::Errno::{EAGAIN, ECHILD, EINTR, ESRCH};
 use nix::libc;
-use nix::pty::{openpty, OpenptyResult};
-use nix::sys::signal::{kill, SigSet, SigmaskHow, Signal};
-use nix::sys::signalfd::{siginfo, SfdFlags, SignalFd};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
-use nix::{
-    poll::{poll, PollFd, PollFlags, PollTimeout},
-    unistd::{read, write},
-};
+use nix::poll::{PollFlags, PollTimeout};
+use nix::pty::OpenptyResult;
+use nix::sys::signalfd::SignalFd;
+use nix::unistd::Pid;
 
 use termios::Termios;
-use termios::{
-    tcsetattr, BRKINT, CS8, CSIZE, ECHO, ECHONL, ICANON, ICRNL, IEXTEN, IGNBRK, IGNCR, INLCR, ISIG,
-    ISTRIP, IXON, OPOST, PARENB, PARMRK, TCSANOW, VMIN, VTIME,
-};
-
-use log::{debug, error, info, trace};
 
 #[derive(Debug)]
-pub enum FdsInfo<'fd> {
-    Signal {
-        fd: SignalFd,
-        buf: Vec<u8>,
-    },
-    Stdin {
-        fd: StdinLock<'fd>,
-        termios: Termios,
-        buf: Vec<u8>,
-    },
-    PtyChild {
-        fd: OpenptyResult,
-        pid: Pid,
-        buf: Vec<u8>,
-    },
+pub enum FdsInfo {
+    Signal { fd: SignalFd },
+    Stdin { fd: Stdin, termios: Termios },
+    PtyMaster { fd: OpenptyResult, _pid: Pid },
 }
 
-pub struct Fds<'fd> {
-    inner: Vec<FdsInfo<'fd>>,
+#[derive(Debug)]
+pub struct Fds {
+    inner: Vec<FdsInfo>,
     inner_poll: Vec<libc::pollfd>,
 }
 
-pub struct FdsIterator<'a, 'b> {
-    todos: &'b Fds<'a>,
+#[derive(Debug)]
+pub struct PollReventConsumeIterator<'a> {
+    fds: &'a Fds,
     index: usize,
 }
 
-impl<'a, 'b> Iterator for FdsIterator<'a, 'b> {
-    type Item = &'b FdsInfo<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.todos.inner.len() {
-            let result = Some(&self.todos.inner[self.index]);
-            self.index += 1;
-            return result;
-        }
-
-        None
-    }
-}
-
-pub struct PollReventMutIterator<'a, 'b> {
-    fds: &'b mut Fds<'a>,
-    index: usize,
-}
-
-impl<'a, 'b> Iterator for PollReventMutIterator<'a, 'b> {
-    type Item = &'b mut FdsInfo<'a>;
+impl<'a> Iterator for PollReventConsumeIterator<'a> {
+    type Item = &'a FdsInfo;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.index < self.fds.inner.len() {
-            let res = &mut self.fds.inner_poll[self.index];
             let index = self.index;
-            self.index += 1;
 
-            if res.revents != 0 {
-                res.revents = 0;
-                let ptr = self.fds.inner.as_mut_ptr();
-                unsafe { return Some(&mut *ptr.add(index)) }
+            let res = {
+                let mut res = self.fds.inner_poll[self.index];
+
+                self.index += 1;
+
+                if res.revents != 0 {
+                    res.revents = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if res {
+                return Some(&self.fds.inner[index]);
             }
         }
 
@@ -96,7 +57,27 @@ impl<'a, 'b> Iterator for PollReventMutIterator<'a, 'b> {
     }
 }
 
-impl<'fd> Fds<'fd> {
+#[derive(Debug)]
+pub struct FdsIterator<'b> {
+    fds: &'b Fds,
+    index: usize,
+}
+
+impl<'b> Iterator for FdsIterator<'b> {
+    type Item = &'b FdsInfo;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.fds.inner.len() {
+            let res = &self.fds.inner[self.index];
+            self.index += 1;
+            return Some(res);
+        }
+
+        None
+    }
+}
+
+impl Fds {
     pub fn new() -> Self {
         Self {
             inner: vec![],
@@ -116,15 +97,15 @@ impl<'fd> Fds<'fd> {
         nix::errno::Errno::result(res)
     }
 
-    pub fn iter<'b>(&'b self) -> FdsIterator<'fd, 'b> {
-        FdsIterator {
-            todos: self,
+    pub fn iter_only_revent(&self) -> PollReventConsumeIterator {
+        PollReventConsumeIterator {
+            fds: self,
             index: 0,
         }
     }
 
-    pub fn iter_only_events<'b>(&'b mut self) -> PollReventMutIterator<'fd, 'b> {
-        PollReventMutIterator {
+    pub fn iter(&self) -> FdsIterator {
+        FdsIterator {
             fds: self,
             index: 0,
         }
@@ -138,10 +119,9 @@ impl<'fd> Fds<'fd> {
         };
 
         // add two array
-        self.inner.push(FdsInfo::PtyChild {
+        self.inner.push(FdsInfo::PtyMaster {
             fd: pty_fd,
-            pid: child,
-            buf: Vec::with_capacity(1024),
+            _pid: child,
         });
         self.inner_poll.push(res);
     }
@@ -154,19 +134,11 @@ impl<'fd> Fds<'fd> {
         };
 
         // add two array
-        self.inner.push(FdsInfo::Signal {
-            fd: signal_fd,
-            buf: Vec::with_capacity(1024),
-        });
+        self.inner.push(FdsInfo::Signal { fd: signal_fd });
         self.inner_poll.push(res);
     }
 
-    pub fn push_stdin_lock(
-        &mut self,
-        stdin: StdinLock<'static>,
-        termios: Termios,
-        events: PollFlags,
-    ) {
+    pub fn push_stdin_fd(&mut self, stdin: Stdin, termios: Termios, events: PollFlags) {
         let res = libc::pollfd {
             fd: stdin.as_raw_fd(),
             events: events.bits(),
@@ -174,12 +146,7 @@ impl<'fd> Fds<'fd> {
         };
 
         // add two array
-        self.inner.push(FdsInfo::Stdin {
-            fd: stdin,
-            // poll_fd: res,
-            termios: termios,
-            buf: Vec::with_capacity(1024),
-        });
+        self.inner.push(FdsInfo::Stdin { fd: stdin, termios });
         self.inner_poll.push(res);
     }
 
@@ -188,10 +155,7 @@ impl<'fd> Fds<'fd> {
             .inner
             .iter()
             .enumerate()
-            .filter(|(_, item)| match item {
-                FdsInfo::Signal { fd: _, buf: _ } => false,
-                _ => true,
-            })
+            .filter(|(_, item)| matches!(item, FdsInfo::Signal { fd: _ }))
             .map(|(i, _)| i)
             .collect();
 
@@ -199,4 +163,8 @@ impl<'fd> Fds<'fd> {
             self.inner.remove(i);
         }
     }
+
+    // pub fn get_fd_by_index(&self, index:usize) -> Option<&FdsInfo> {
+    //     self.inner.get(index)
+    // }
 }

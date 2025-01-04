@@ -5,4 +5,11 @@
     "rust-analyzer.completion.autoimport.enable": true,
     "rust-analyzer.cargo.allTargets": true,
     "rust-analyzer.cargo.autoreload": true,
-}
+    "rust-analyzer.checkOnSave.command": "clippy",
+    "rust-analyzer.cargo.allFeatures": true,
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "[jsonc]": {
+      "editor.defaultFormatter": "vscode.json-language-features"
+    }
+  }

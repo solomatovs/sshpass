@@ -1,8 +1,8 @@
-pub trait NativeApp<'a, R: 'a> {
-    fn poll(&'a self, timeout: i32) -> R;
-    fn write_stdout(&self, buf: &[u8]);
-    fn write_pty(&self, buf: &[u8]);
-}
+// pub trait NativeApp<R> {
+//     fn poll(&self, timeout: i32) -> R;
+//     fn write_stdout(&self, buf: &[u8]);
+//     fn write_pty(&self, buf: &[u8]);
+// }
 
 // pub trait MainApp {
 //     fn handle_stdin(&self, buf: &[u8]);

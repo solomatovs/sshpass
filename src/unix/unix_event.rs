@@ -1,53 +1,45 @@
-use std::borrow::BorrowMut;
-use std::boxed::Box;
-use std::cell::{Ref, RefCell, RefMut};
-use std::io::{Stdin, StdinLock, Write};
-use std::os::fd::BorrowedFd;
-use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
-use std::os::unix::process::CommandExt;
-use std::process::Stdio;
-use std::rc::Rc;
+use nix::sys::signal::Signal;
+use nix::sys::signalfd::siginfo;
+// use nix::unistd::Pid;
+use std::cell::Ref;
 
-use clap::parser::ValuesRef;
-use nix::errno::Errno::{EAGAIN, ECHILD, EINTR, ESRCH};
-use nix::libc;
-use nix::pty::{openpty, OpenptyResult};
-use nix::sys::signal::{kill, SigSet, SigmaskHow, Signal};
-use nix::sys::signalfd::{siginfo, SfdFlags, SignalFd};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
-use nix::{
-    poll::{poll, PollFd, PollFlags, PollTimeout},
-    unistd::{read, write},
-};
-
-use termios::Termios;
-use termios::{
-    tcsetattr, BRKINT, CS8, CSIZE, ECHO, ECHONL, ICANON, ICRNL, IEXTEN, IGNBRK, IGNCR, INLCR, ISIG,
-    ISTRIP, IXON, OPOST, PARENB, PARMRK, TCSANOW, VMIN, VTIME,
-};
-
-use clap::ArgMatches;
-use log::{debug, error, info, trace};
-
-use crate::app::NativeApp;
 
 #[derive(Debug)]
 pub enum UnixEvent<'a> {
-    // Ptyin(Ref<'a, [u8]>, usize),
-    // Stdin(Ref<'a, [u8]>, usize),
-    Ptyin(&'a [u8]),
-    Stdin(&'a [u8]),
-    SignalToShutdown(siginfo),
-    SignalToResize(siginfo),
-    SignalChildStatus(siginfo),
-    SignalStop(siginfo),
-    Timeout,
-    ChildExited(Pid, i32),
-    ChildSignaled(Pid, Signal, bool),
-    StdIoError(std::io::Error),
-    NixErrorno(nix::errno::Errno),
-    EventNotCapture,
+    // PtyMaster(&'a [u8]),
+    // Stdin(&'a [u8]),
+    // Signal(Signal, &'a siginfo),
+    Stdin(Ref<'a, [u8]>),
+    PtyMaster(Ref<'a, [u8]>),
+    Signal(Signal, Ref<'a, siginfo>),
+        // struct signalfd_siginfo {
+        //     uint32_t ssi_signo;    /* Signal number */
+        //     int32_t  ssi_errno;    /* Error number (unused) */
+        //     int32_t  ssi_code;     /* Signal code */
+        //     uint32_t ssi_pid;      /* PID of sender */
+        //     uint32_t ssi_uid;      /* Real UID of sender */
+        //     int32_t  ssi_fd;       /* File descriptor (SIGIO) */
+        //     uint32_t ssi_tid;      /* Kernel timer ID (POSIX timers)
+        //     uint32_t ssi_band;     /* Band event (SIGIO) */
+        //     uint32_t ssi_overrun;  /* POSIX timer overrun count */
+        //     uint32_t ssi_trapno;   /* Trap number that caused signal */
+        //     int32_t  ssi_status;   /* Exit status or signal (SIGCHLD) */
+        //     int32_t  ssi_int;      /* Integer sent by sigqueue(3) */
+        //     uint64_t ssi_ptr;      /* Pointer sent by sigqueue(3) */
+        //     uint64_t ssi_utime;    /* User CPU time consumed (SIGCHLD) */
+        //     uint64_t ssi_stime;    /* System CPU time consumed
+        //                               (SIGCHLD) */
+        //     uint64_t ssi_addr;     /* Address that generated signal
+        //                               (for hardware-generated signals) */
+        //     uint16_t ssi_addr_lsb; /* Least significant bit of address
+        //                               (SIGBUS; since Linux 2.6.37) */
+        //     uint8_t  pad[X];       /* Pad size to 128 bytes (allow for
+        //                               additional fields in the future) */
+        // };
+    ReadZeroBytes,
+    PollTimeout,
+    // ChildExited(Pid, i32),
+    // ChildSignaled(Pid, Signal, bool),
 }
 
 impl std::fmt::Display for UnixEvent<'_> {
@@ -56,17 +48,17 @@ impl std::fmt::Display for UnixEvent<'_> {
     }
 }
 
-impl From<std::io::Error> for UnixEvent<'_> {
-    fn from(e: std::io::Error) -> Self {
-        UnixEvent::StdIoError(e)
-    }
-}
+// impl From<std::io::Error> for UnixEvent<'_> {
+//     fn from(e: std::io::Error) -> Self {
+//         UnixEvent::StdIoError(e)
+//     }
+// }
 
-impl From<nix::errno::Errno> for UnixEvent<'_> {
-    fn from(e: nix::errno::Errno) -> Self {
-        UnixEvent::NixErrorno(e)
-    }
-}
+// impl From<nix::errno::Errno> for UnixEvent<'_> {
+//     fn from(e: nix::errno::Errno) -> Self {
+//         UnixEvent::NixErrorno(e)
+//     }
+// }
 
 // impl<'a> From<WaitStatus> for UnixEvent<'a> {
 //     fn from(e: WaitStatus) -> Self {
