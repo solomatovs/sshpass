@@ -1,6 +1,5 @@
 use nix::sys::signal::Signal;
 use nix::sys::signalfd::siginfo;
-use nix::unistd::Pid;
 use std::cell::Ref;
 
 

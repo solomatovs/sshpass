@@ -1,14 +1,15 @@
-
-use std::str::FromStr;
-use nix::sys::signal::Signal;
 use clap::{Arg, ArgGroup, Command};
-use log::{trace, error};
+use log::trace;
+use nix::sys::signal::Signal;
+use std::str::FromStr;
+use std::cell::Ref;
+use std::sync::mpsc;
 
 mod app;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::{UnixApp, UnixAppStop, UnixEvent, UnixError};
+use unix::{UnixApp, UnixAppStop, UnixError, UnixEvent};
 
 fn cli() -> Command {
     Command::new("sshpass")
@@ -138,6 +139,14 @@ fn cli() -> Command {
         )
 }
 
+#[derive(Debug)]
+enum UnixEventResponse<'a> {
+    SendTo(usize, Ref<'a, [u8]>),
+    WriteToStdOut(Ref<'a, [u8]>),
+    WriteToStdIn(Ref<'a, [u8]>),
+    WriteToPtyMaster(Ref<'a, [u8]>),
+}
+
 fn main() {
     if let Ok(level) = std::env::var("SSHPASS_LOG") {
         let level = log::LevelFilter::from_str(&level).unwrap();
@@ -163,63 +172,84 @@ fn main() {
     #[cfg(target_os = "linux")]
     let status = {
         trace!("app ok, create unix app");
-        let mut stop = UnixAppStop::new();
         let app = UnixApp::new(args).unwrap();
+        let mut stop = UnixAppStop::new();
+        let (tx, rx) = mpsc::channel();
         loop {
-            match app.system_event() {
-                Ok(res) => match res {
-                    UnixEvent::PollTimeout => {
-                        // проверяю остановлено ли приложение
-                        if stop.is_stoped() {
-                            break stop.stop_code();
+            {
+                let res = app.system_event();
+                match res {
+                    Ok(res) => match res {
+                        UnixEvent::PollTimeout => {
+                            // проверяю остановлено ли приложение
+                            if stop.is_stoped() {
+                                break stop.stop_code();
+                            }
                         }
-                    }
-                    // UnixEvent::ChildExited(_pid, status) => {
-                    //     trace!("child {} exit: {}", _pid, status);
-                    // }
-                    // UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
-                    //     trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
-                    // }
-                    UnixEvent::PtyMaster(_index, buf) => {
-                        trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
-                        // app.send_to(0, buf);
-                    }
-                    UnixEvent::PtySlave(_index, buf) => {
-                        trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
-                        // app.send_to(0, buf);
-                    }
-                    UnixEvent::Stdin(_index, buf) => {
-                        trace!("stdin utf8: {}", String::from_utf8_lossy(&buf));
-                    }
-                    UnixEvent::Signal(_index, sig, _sigino) => {
-                        trace!("signal {:#?}", sig);
-                        // trace!("signal info {:#?}", sigino);
-                        if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
-                            stop.set_stop(0);
+                        // UnixEvent::ChildExited(_pid, status) => {
+                        //     trace!("child {} exit: {}", _pid, status);
+                        // }
+                        // UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
+                        //     trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
+                        // }
+                        UnixEvent::PtyMaster(_index, buf) => {
+                            trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
+                            tx.send(UnixEventResponse::WriteToStdOut(buf)).unwrap();
+                            
+                            // app.send_to(0, buf);
                         }
+                        UnixEvent::PtySlave(_index, buf) => {
+                            trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
+                            // app.send_to(0, buf);
+                        }
+                        UnixEvent::Stdin(_index, buf) => {
+                            trace!("stdin utf8: {}", String::from_utf8_lossy(&buf));
+                            // let buf_to = Ref::clone(&buf);
+                            tx.send(UnixEventResponse::WriteToPtyMaster(buf)).unwrap();
+                        }
+                        UnixEvent::Signal(_index, sig, _sigino) => {
+                            trace!("signal {:#?}", sig);
+                            if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
+                                stop.shutdown_starting(0, None);
+                            }
+    
+                            if matches!(sig, Signal::SIGCHLD) {
+                                let pid = _sigino.ssi_pid as nix::libc::pid_t;
+                                let res = app.waitpid(pid);
+                                trace!("waitpid({}) = {:#?}", pid, res);
+                            }
+                        }
+                        UnixEvent::ReadZeroBytes => {
+                            trace!("read zero bytes");
+                        }
+                    },
+                    Err(UnixError::StdIoError(ref e)) => {
+                        stop.shutdown_starting(1, Some(format!("IO Error: {}", e)));
+                    }
+                    Err(UnixError::NixErrorno(ref e)) => {
+                        stop.shutdown_starting(2, Some(format!("Nix Error: {}", e)));
+                    }
+                    Err(UnixError::PollEventNotHandle) => {
+                        stop.shutdown_starting(3, Some("the poll event not handle".to_owned()));
+                    }
+                }    
+            }
 
-                        if matches!(sig, Signal::SIGCHLD) {
-                            let pid = _sigino.ssi_pid as nix::libc::pid_t;
-                            let res = app.waitpid(pid);
-                            trace!("waitpid({}) = {:#?}", pid, res);
-                        }
+            for res in rx.try_iter() {
+                match res {
+                    UnixEventResponse::SendTo(index, buf) => {
+                        app.send_to(index, &buf);
                     }
-                    UnixEvent::ReadZeroBytes => {
-                        trace!("read zero bytes");
+                    UnixEventResponse::WriteToStdOut(buf) => {
+                        app.write_to_stdout(&buf);
                     }
-                }
-                Err(UnixError::StdIoError(ref e)) => {
-                    error!("IO Error: {}", e);
-                    stop.set_stop(1);
-                }
-                Err(UnixError::NixErrorno(ref e)) => {
-                    error!("Nix Error: {}", e);
-                    stop.set_stop(2);
-                }
-                Err(UnixError::PollEventNotHandle) => {
-                    error!("the poll reported the event");
-                    error!("However, the event was not read through the handlers");
-                    stop.set_stop(3);
+                    UnixEventResponse::WriteToStdIn(buf) => {
+                        app.write_to_stdin(&buf);
+                    }
+                    UnixEventResponse::WriteToPtyMaster(buf) => {
+                        app.write_to_pty_master(&buf);
+                        // app.write_to_stdout(&buf);
+                    }
                 }
             }
         }

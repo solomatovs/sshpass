@@ -1,4 +1,4 @@
-use std::borrow::BorrowMut;
+use std::borrow::{Borrow, BorrowMut};
 use std::boxed::Box;
 use std::cell::{Ref, RefCell};
 use std::io::Stdin;
@@ -6,19 +6,18 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
-use std::time::{Instant, Duration};
+use std::time::Instant;
 
 use nix::errno::Errno::EAGAIN;
 use nix::pty::{openpty, OpenptyResult};
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::signalfd::{siginfo, SfdFlags, SignalFd};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, ForkResult};
 use nix::unistd::Pid;
+use nix::unistd::{fork, ForkResult};
 use nix::{
     poll::{PollFlags, PollTimeout},
     unistd::read,
-    unistd::write,
 };
 
 use termios::Termios;
@@ -29,7 +28,7 @@ use termios::{
 
 use clap::parser::ValuesRef;
 use clap::ArgMatches;
-use log::{error, trace, info, debug};
+use log::{error, trace};
 
 use crate::unix::fds::{Fd, Poller};
 use crate::unix::unix_error::UnixError;
@@ -152,6 +151,8 @@ impl UnixApp {
 
         res.reg_non_canonical_stdin()?;
 
+        res.reg_stdout()?;
+
         Ok(res)
     }
     pub fn reg_pty_child(
@@ -175,7 +176,7 @@ impl UnixApp {
                     }
                     Ok(master) => master,
                 };
-                
+
                 // Перенаправляем стандартный ввод, вывод и ошибки в псевдотерминал
                 unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCNOTTY) };
                 unsafe { nix::libc::setsid() };
@@ -208,7 +209,9 @@ impl UnixApp {
             Ok(ForkResult::Parent { child }) => {
                 // эта исполняется только в родительском процессе
                 // возвращаю pty дескриптор для отслеживания событий через poll
-                self.poller.fds.push_pty_fd(pty, child, PollFlags::POLLIN);
+                self.poller
+                    .fds
+                    .push_pty_fd(pty, child, PollFlags::POLLIN);
 
                 Ok(())
             }
@@ -235,7 +238,7 @@ impl UnixApp {
 
         Ok(())
     }
-    
+
     pub fn reg_non_canonical_stdin(&mut self) -> Result<(), UnixError> {
         // перевожу stdin в режим non canonical для побайтовой обработки вводимых данных
         // добавляю в контейнер fds для дальнейшего отслеживания событий через poll
@@ -292,11 +295,10 @@ impl UnixApp {
     fn deinit(&mut self) -> Result<(), UnixError> {
         trace!("deinit fds...");
         for fd in self.poller.iter() {
-            match fd {
-                Fd::Signal { fd: _, .. } => {}
-                Fd::PtyMaster {
-                    fd: _, child: _, ..
-                } => {}
+            match &*fd {
+                Fd::Signal { .. } => {}
+                Fd::PtyMaster { .. } => {}
+                Fd::PtySlave { .. } => {}
                 Fd::Stdin { fd, termios, .. } => {
                     // Восстанавливаем исходные атрибуты терминала
                     trace!("termios restore: {:#?}", termios);
@@ -500,9 +502,9 @@ impl UnixApp {
     fn match_pty_master_event(
         &self,
         index: usize,
-        fd: &OpenptyResult,
+        fd: &OwnedFd,
     ) -> Result<UnixEvent, UnixError> {
-        let res = Self::read_event(fd.master.as_raw_fd(), &mut self.buf.get_mut_slice());
+        let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
         match res {
             Err(e) => {
                 // error
@@ -527,9 +529,9 @@ impl UnixApp {
     fn match_pty_slave_event(
         &self,
         index: usize,
-        fd: &OpenptyResult,
+        fd: &OwnedFd,
     ) -> Result<UnixEvent, UnixError> {
-        let res = Self::read_event(fd.slave.as_raw_fd(), &mut self.buf.get_mut_slice());
+        let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
         match res {
             Err(e) => {
                 // error
@@ -596,12 +598,15 @@ impl UnixApp {
 
         // Извлекаем необходимую информацию из итератора
         if let Some((fd, index)) = self.poller.revent_iter().next() {
-            match fd {
+            match &*fd {
                 Fd::Signal { fd, .. } => {
                     return self.match_signal_event(index, fd);
                 }
                 Fd::PtyMaster { fd, .. } => {
                     return self.match_pty_master_event(index, fd);
+                }
+                Fd::PtySlave { fd, .. } => {
+                    return self.match_pty_slave_event(index, fd);
                 }
                 Fd::Stdin { fd, .. } => {
                     return self.match_stdin_event(index, fd);
@@ -615,51 +620,21 @@ impl UnixApp {
         Err(UnixError::PollEventNotHandle)
     }
 
-    // pub fn write_to_pty(&self, buf: &[u8]) -> Result<(), UnixError> {
-    //     let res = self.fds.borrow_mut().write_to_pty(buf);
-    //     match res {
-    //         Err(e) => {
-    //             error!("write_to_pty error: {}", e);
-    //             return Err(e);
-    //         }
-    //         Ok(n) => {
-    //             trace!("write_to_pty Ok({n}) bytes");
-    //             Ok(())
-    //         }
-    //     }
-    // }
+    pub fn send_to(&self, index: usize, buf: &Ref<[u8]>) {
+        self.poller.fds.send_to(index, buf)
+    }
 
-    // pub fn write_to_stdout(&self, buf: &[u8]) {
-    //     let mut stdout = std::io::stdout().lock();
+    pub fn write_to_stdout(&self, buf: &Ref<[u8]>) {
+        self.poller.fds.write_to_stdout(buf);
+    }
 
-    //     if let Err(e) = stdout.write_all(buf) {
-    //         trace!("Err(e) = stdout.write_all(&buf[..n])");
-    //         error!("stdout write error");
-    //         error!("{e}");
-    //     }
-    //     if let Err(e) = stdout.flush() {
-    //         trace!("Err(e) = stdout.write_all(&buf[..n])");
-    //         error!("stdout write error");
-    //         error!("{e}");
-    //     }
-    // }
+    pub fn write_to_stdin(&self, buf: &Ref<[u8]>) {
+        self.poller.fds.write_to_stdin(buf);
+    }
 
-    // pub fn send_to(&self, index: usize, buf: &[u8]) -> Result<(), UnixError> {
-        // let res = match self.poller.fds.get_fd_by_index(index) {
-        //     Some(Fd::PtyMaster { fd, .. }) => write(&fd, buf).map_err(|e| e.into()).map(|_| ()),
-        //     // Some(Fd::PtySlave { fd, .. }) => write(&fd, buf).map_err(|e| e.into()).map(|_| ()),
-        //     Some(Fd::Signal { fd, .. }) => Err(UnixError::FdReadOnly),
-        //     Some(Fd::Stdin { fd, .. }) => {
-        //         let _ = fd.lock();
-        //         write(fd.as_fd(), buf).map_err(|e| e.into()).map(|_| ())
-        //     }
-        //     None => Err(UnixError::FdReadOnly),
-        // };
-
-        // res
-
-    //     todo!()
-    // }
+    pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
+        self.poller.fds.write_to_pty_master(buf);
+    }
 }
 
 impl Drop for UnixApp {
@@ -670,13 +645,13 @@ impl Drop for UnixApp {
     }
 }
 
-
 #[derive(Debug)]
 pub struct UnixAppStop {
     is_stoped: bool,
     is_stop: bool,
-    is_stop_time: Option<Instant>,
+    stop_time: Option<Instant>,
     stop_code: Option<i32>,
+    stop_error: Option<String>,
 }
 
 impl UnixAppStop {
@@ -684,8 +659,9 @@ impl UnixAppStop {
         Self {
             is_stoped: false,
             is_stop: false,
-            is_stop_time: None,
+            stop_time: None,
             stop_code: None,
+            stop_error: None,
         }
     }
 
@@ -697,10 +673,25 @@ impl UnixAppStop {
         self.is_stoped
     }
 
-    pub fn set_stop(&mut self, stop_code: i32) {
+    pub fn shutdown_starting(&mut self, stop_code: i32, error: Option<String>) {
+        self.stop_time = Some(Instant::now());
         self.is_stop = true;
-        self.is_stop_time = Some(Instant::now());
+        self.is_stoped = false;
         self.stop_code = Some(stop_code);
+        self.stop_error = error;
+    }
+
+    pub fn shutdown_complited(&mut self) {
+        self.is_stop = false;
+        self.is_stoped = true;
+    }
+
+    pub fn shutdown_cancel(&mut self) {
+        self.is_stop = false;
+        self.is_stoped = false;
+        self.stop_time = None;
+        self.stop_code = None;
+        self.stop_error = None;
     }
 
     pub fn stop_code(&self) -> i32 {

@@ -1,18 +1,18 @@
 use std::borrow::{Borrow, BorrowMut};
-use std::io::{Stdin, Stdout, Write};
+use std::io::{Stdin, Stdout};
 // use std::ops::Deref;
-// use std::os::fd;
-use std::cell::{RefCell, RefMut, Ref};
-use std::ops::DerefMut;
+use std::os::fd::OwnedFd;
+use std::cell::{Ref, RefCell, RefMut};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use nix::libc::{self, pollfd};
+use nix::libc::{self};
 use nix::poll::{PollFlags, PollTimeout};
 use nix::pty::OpenptyResult;
 use nix::sys::signalfd::SignalFd;
 use nix::unistd::{write, Pid};
 
-use log::{trace, error, debug, info};
+use log::error;
 
 use termios::Termios;
 
@@ -32,9 +32,13 @@ pub enum Fd {
         events: PollFlags,
     },
     PtyMaster {
-        fd: OpenptyResult,
+        fd: OwnedFd,
         events: PollFlags,
         child: Pid,
+    },
+    PtySlave {
+        fd: OwnedFd,
+        events: PollFlags,
     },
 }
 
@@ -44,7 +48,8 @@ impl Fd {
             Fd::Signal { fd, .. } => fd.as_raw_fd(),
             Fd::Stdin { fd, .. } => fd.as_raw_fd(),
             Fd::Stdout { fd, .. } => fd.as_raw_fd(),
-            Fd::PtyMaster { fd, .. } => fd.master.as_raw_fd(),
+            Fd::PtyMaster { fd, .. } => fd.as_raw_fd(),
+            Fd::PtySlave { fd, .. } => fd.as_raw_fd(),
         }
     }
     pub fn events(&self) -> &PollFlags {
@@ -53,26 +58,21 @@ impl Fd {
             Fd::Stdin { events, .. } => events,
             Fd::Stdout { events, .. } => events,
             Fd::PtyMaster { events, .. } => events,
+            Fd::PtySlave { events, .. } => events,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Fds {
-    inner: Vec<Fd>,
+    inner: Vec<RefCell<Fd>>,
     pollfds: RefCell<Option<Vec<libc::pollfd>>>,
     signalfd_index: Option<usize>,
     stdin_index: Option<usize>,
     stdout_index: Option<usize>,
+    pty_master_index: Option<usize>,
+    pty_slave_index: Option<usize>,
 }
-
-// impl Deref for Fds {
-//     type Target = Vec<Fd>;
-
-//     fn deref(&self) -> &Self::Target {
-//         &self.inner
-//     }
-// }
 
 impl Fds {
     pub fn new() -> Self {
@@ -82,8 +82,18 @@ impl Fds {
             signalfd_index: None,
             stdin_index: None,
             stdout_index: None,
+            pty_master_index: None,
+            pty_slave_index: None,
         }
     }
+
+    // pub fn stdout_index(self) -> Option<usize> {
+    //     self.stdout_index.clone()
+    // }
+
+    // pub fn stdin_index(self) -> Option<usize> {
+    //     self.stdin_index.clone()
+    // }
 
     /// Возвращает количество файловых дескрипторов в списке
     pub fn len(&self) -> usize {
@@ -95,7 +105,10 @@ impl Fds {
         self.len() == 0
     }
 
-    fn get_pollfd_by_raw_id<'a>(pollfds: &'a mut RefMut<Vec<libc::pollfd>>, raw_fd: i32) -> Option<&'a mut libc::pollfd> {
+    fn get_pollfd_by_raw_id<'a>(
+        pollfds: &'a mut RefMut<Vec<libc::pollfd>>,
+        raw_fd: i32,
+    ) -> Option<&'a mut libc::pollfd> {
         let res = pollfds.deref_mut();
         let res = res.iter_mut().find(|x| x.fd == raw_fd);
 
@@ -103,12 +116,15 @@ impl Fds {
     }
 
     /// Возвращает ссылку на файловый дескриптор по индексу
-    pub fn get_fd_by_index(&self, index: usize) -> Option<&Fd> {
+    pub fn get_fd_by_index(&self, index: usize) -> Option<&RefCell<Fd>> {
         self.inner.get(index)
     }
 
-    pub fn get_fd_by_raw_fd(&self, raw_fd: i32) -> Option<&Fd> {
-        self.inner.iter().filter(|f| f.as_raw_fd() == raw_fd).last()
+    pub fn get_fd_by_raw_fd(&self, raw_fd: i32) -> Option<&RefCell<Fd>> {
+        self.inner
+            .iter()
+            .filter(|f| (*f).borrow().as_raw_fd() == raw_fd)
+            .last()
     }
 
     /// Метод возвращает массив pollfd, который используется в nix::poll::poll.
@@ -116,13 +132,14 @@ impl Fds {
     /// Если pollfds был создан, то возвращается ссылка на него.
     pub fn as_pollfds(&self) -> RefMut<Vec<libc::pollfd>> {
         let res = self.pollfds.borrow_mut().as_deref().is_none();
-        
+
         if res {
-            let fds: Vec<libc::pollfd> = self.inner
+            let fds: Vec<libc::pollfd> = self
+                .inner
                 .iter()
                 .map(|fd| libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: fd.events().bits(),
+                    fd: fd.borrow().as_raw_fd(),
+                    events: fd.borrow().events().bits(),
                     revents: 0,
                 })
                 .collect();
@@ -130,30 +147,15 @@ impl Fds {
             self.pollfds.replace(Some(fds));
         }
 
-        let res = RefMut::map(
-            self.pollfds.borrow_mut(),
-            |pollfds| pollfds.as_mut().unwrap(),
-        );
+        let res = RefMut::map(self.pollfds.borrow_mut(), |pollfds| {
+            pollfds.as_mut().unwrap()
+        });
 
-        return res;
-
-
-            // self.pollfds
-            // .get_or_insert_with(|| {
-            //     self.inner
-            //         .iter()
-            //         .map(|fd| libc::pollfd {
-            //             fd: fd.as_raw_fd(),
-            //             events: fd.events().bits(),
-            //             revents: 0,
-            //         })
-            //         .collect()
-            // })
-            // .as_mut_slice()
+        res
     }
 
     fn _push_fd(&mut self, new_fd: Fd) {
-        self.inner.push(new_fd);
+        self.inner.push(RefCell::new(new_fd));
         self.pollfds = RefCell::new(None); // Обнуляем кэш, чтобы пересоздать его позже
     }
 
@@ -164,16 +166,24 @@ impl Fds {
             Fd::Stdin { .. } => self._push_fd(new_fd),
             Fd::Stdout { .. } => self._push_fd(new_fd),
             Fd::PtyMaster { .. } => self._push_fd(new_fd),
+            Fd::PtySlave { .. } => self._push_fd(new_fd),
         }
     }
 
     /// Добавляет дескриптор pty (master и slave дестрикторы) в список файловых дскрипторов
     pub fn push_pty_fd(&mut self, pty_fd: OpenptyResult, child: Pid, events: PollFlags) {
         self._push_fd(Fd::PtyMaster {
-            fd: pty_fd,
+            fd: pty_fd.master,
             events,
             child,
         });
+        self.pty_master_index = Some(self.inner.len() - 1);
+
+        self._push_fd(Fd::PtySlave {
+            fd: pty_fd.slave,
+            events,
+        });
+        self.pty_master_index = Some(self.inner.len() - 1);
     }
 
     /// Добавляет дескриптор сигнала в список файловых дескрипторов
@@ -201,71 +211,73 @@ impl Fds {
         self.stdin_index = Some(self.inner.len() - 1);
     }
 
-    /// Удаляет дескриптор сигнала из списка файловых дескрипторов
-    pub fn remove_signal_fd(&mut self) {
-        if let Some(index) = self.signalfd_index {
-            self.inner.remove(index);
-            self.signalfd_index = None;
-            self.pollfds = RefCell::new(None);
-        }
-    }
-
-    /// Удаляет дескриптор stdin из списка файловых дескрипторов
-    pub fn remove_stdin_fd(&mut self) {
-        if let Some(index) = self.stdin_index {
-            self.inner.remove(index);
-            self.stdin_index = None;
-            self.pollfds = RefCell::new(None);
-        }
-    }
-
-    /// Удаляет дескриптор stdout из списка файловых дескрипторов
-    pub fn remove_stdout_fd(&mut self) {
-        if let Some(index) = self.stdout_index {
-            self.inner.remove(index);
-            self.stdout_index = None;
-            self.pollfds = RefCell::new(None);
-        }
-    }
-
     /// Удаляет последний файловый дескриптор из списка файловых дескрипторов
     /// Если список файловых дескрипторов пуст, то ничего не делает
     pub fn pop_fd(&mut self) {
-        if let Some(fd) = self.inner.last() {
-            match fd {
-                Fd::Signal { .. } => self.remove_signal_fd(),
-                Fd::Stdin { .. } => self.remove_stdin_fd(),
-                Fd::Stdout { .. } => self.remove_stdout_fd(),
+        let res = self.inner.pop();
+
+        if let Some(fd) = res {
+            match *fd.borrow() {
+                Fd::Signal { .. } => {
+                    self.signalfd_index = None;
+                }
+                Fd::Stdin { .. } => {
+                    self.stdin_index = None;
+                }
+                Fd::Stdout { .. } => {
+                    self.stdout_index = None;
+                }
                 Fd::PtyMaster { .. } => {
-                    self.inner.pop();
-                    self.pollfds = RefCell::new(None);
+                    self.pty_master_index = None;
+                }
+                Fd::PtySlave { .. } => {
+                    self.pty_slave_index = None;
                 }
             }
+
+            self.pollfds = RefCell::new(None);
         }
     }
 
-    pub fn send_to(&mut self, index: usize, buf: &[u8]) {
-        if let Some(fd) = self.inner.get_mut(index) {
-            let res = match fd {
+    pub fn send_to(&self, index: usize, buf: &Ref<[u8]>) {
+        if let Some(fd) = self.inner.get(index) {
+            let mut res = fd.borrow_mut();
+            let res = res.deref_mut();
+            let res = match res {
                 Fd::Signal { fd, .. } => {
                     error!("attempt to send a message to signalfd. this is not possible because signalfd can only be read");
-                    write(fd, buf)
-                },
+                    write(fd, buf.borrow())
+                }
                 Fd::Stdin { fd, .. } => {
                     error!("attempt to send a message to signalfd. this is not possible because signalfd can only be read");
-                    write(fd, buf)
-                },
-                Fd::Stdout { fd, .. } => {
-                    write(fd, buf)
-                },
-                Fd::PtyMaster { fd, .. } => {
-                    write(&fd.master, buf)
+                    write(fd, buf.borrow())
                 }
+                Fd::Stdout { fd, .. } => write(fd, buf.borrow()),
+                Fd::PtyMaster { fd, .. } => write(&fd, buf.borrow()),
+                Fd::PtySlave { fd, .. } => write(&fd, buf.borrow()),
             };
 
             if let Err(e) = res {
                 error!("error while sending message to fd: {}", e);
             }
+        }
+    }
+
+    pub fn write_to_stdout(&self, buf: &Ref<[u8]>) {
+        if let Some(index) = self.stdout_index {
+            self.send_to(index, buf);
+        }
+    }
+
+    pub fn write_to_stdin(&self, buf: &Ref<[u8]>) {
+        if let Some(index) = self.stdin_index {
+            self.send_to(index, buf);
+        }
+    }
+
+    pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
+        if let Some(index) = self.pty_master_index {
+            self.send_to(index, buf);
         }
     }
 }
@@ -288,7 +300,7 @@ pub struct PollReventIterator<'a> {
 }
 
 impl<'a> Iterator for PollReventIterator<'a> {
-    type Item = (&'a Fd, usize);
+    type Item = (Ref<'a, Fd>, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
         let len = self.fds.len();
@@ -297,8 +309,10 @@ impl<'a> Iterator for PollReventIterator<'a> {
             self.index += 1;
 
             let fd = self.fds.get_fd_by_index(index).unwrap();
+            let fd = fd.borrow();
+            let raw_fd = fd.as_raw_fd();
             let mut res = self.fds.as_pollfds();
-            let res = Fds::get_pollfd_by_raw_id(&mut res, fd.as_raw_fd());
+            let res = Fds::get_pollfd_by_raw_id(&mut res, raw_fd);
 
             if let Some(res) = res {
                 if res.revents != 0 {
@@ -312,7 +326,6 @@ impl<'a> Iterator for PollReventIterator<'a> {
     }
 }
 
-
 /// Итератор по файловым дескрипторам
 #[derive(Debug)]
 pub struct FdsIterator<'b> {
@@ -321,11 +334,12 @@ pub struct FdsIterator<'b> {
 }
 
 impl<'b> Iterator for FdsIterator<'b> {
-    type Item = &'b Fd;
+    type Item = Ref<'b, Fd>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.poller.fds.len() {
             let res = self.poller.fds.get_fd_by_index(self.index).unwrap();
+            let res = res.borrow();
             self.index += 1;
             return Some(res);
         }
@@ -333,7 +347,6 @@ impl<'b> Iterator for FdsIterator<'b> {
         None
     }
 }
-
 
 impl Poller {
     pub fn new(poll_timeout: PollTimeout) -> Self {
