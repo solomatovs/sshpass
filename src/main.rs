@@ -8,7 +8,7 @@ mod app;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::{UnixApp, UnixEvent, UnixError};
+use unix::{UnixApp, UnixAppStop, UnixEvent, UnixError};
 
 fn cli() -> Command {
     Command::new("sshpass")
@@ -163,52 +163,64 @@ fn main() {
     #[cfg(target_os = "linux")]
     let status = {
         trace!("app ok, create unix app");
-        let mut app = UnixApp::new(args).unwrap();
+        let mut stop = UnixAppStop::new();
+        let app = UnixApp::new(args).unwrap();
         loop {
-            {
-                match app.system_event() {
-                    Ok(res) => match res {
-                        UnixEvent::PollTimeout => {
-                            trace!("poll timeout");
-                        }
-                        // UnixEvent::ChildExited(_pid, status) => {
-                        //     trace!("child {} exit: {}", _pid, status);
-                        // }
-                        // UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
-                        //     trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
-                        // }
-                        UnixEvent::PtyMaster(buf) => {
-                            trace!("pty utf8: {}", String::from_utf8_lossy(buf.trim_ascii()));
-                            // app.send_to(0, buf);
-                        }
-                        UnixEvent::Stdin(buf) => {
-                            trace!("stdin utf8: {}", String::from_utf8_lossy(buf.trim_ascii()));
-                        }
-                        UnixEvent::Signal(sig, _sigino) => {
-                            trace!("signal {:#?}", sig);
-                            // trace!("signal info {:#?}", sigino);
-                            if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
-                                break 0;
-                            }
-                        }
-                        UnixEvent::ReadZeroBytes => {
-                            trace!("read zero bytes");
+            match app.system_event() {
+                Ok(res) => match res {
+                    UnixEvent::PollTimeout => {
+                        // проверяю остановлено ли приложение
+                        if stop.is_stoped() {
+                            break stop.stop_code();
                         }
                     }
-                    Err(UnixError::StdIoError(ref e)) => {
-                        error!("IO Error: {}", e);
-                        break 1;
+                    // UnixEvent::ChildExited(_pid, status) => {
+                    //     trace!("child {} exit: {}", _pid, status);
+                    // }
+                    // UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
+                    //     trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
+                    // }
+                    UnixEvent::PtyMaster(_index, buf) => {
+                        trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
+                        // app.send_to(0, buf);
                     }
-                    Err(UnixError::NixErrorno(ref e)) => {
-                        error!("Nix Error: {}", e);
-                        break 2;
+                    UnixEvent::PtySlave(_index, buf) => {
+                        trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
+                        // app.send_to(0, buf);
                     }
-                    Err(UnixError::PollEventNotHandle) => {
-                        error!("the poll reported the event");
-                        error!("However, the event was not read through the handlers");
-                        break 3;
+                    UnixEvent::Stdin(_index, buf) => {
+                        trace!("stdin utf8: {}", String::from_utf8_lossy(&buf));
                     }
-                }    
+                    UnixEvent::Signal(_index, sig, _sigino) => {
+                        trace!("signal {:#?}", sig);
+                        // trace!("signal info {:#?}", sigino);
+                        if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
+                            stop.set_stop(0);
+                        }
+
+                        if matches!(sig, Signal::SIGCHLD) {
+                            let pid = _sigino.ssi_pid as nix::libc::pid_t;
+                            let res = app.waitpid(pid);
+                            trace!("waitpid({}) = {:#?}", pid, res);
+                        }
+                    }
+                    UnixEvent::ReadZeroBytes => {
+                        trace!("read zero bytes");
+                    }
+                }
+                Err(UnixError::StdIoError(ref e)) => {
+                    error!("IO Error: {}", e);
+                    stop.set_stop(1);
+                }
+                Err(UnixError::NixErrorno(ref e)) => {
+                    error!("Nix Error: {}", e);
+                    stop.set_stop(2);
+                }
+                Err(UnixError::PollEventNotHandle) => {
+                    error!("the poll reported the event");
+                    error!("However, the event was not read through the handlers");
+                    stop.set_stop(3);
+                }
             }
         }
     };

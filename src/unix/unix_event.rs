@@ -1,6 +1,6 @@
 use nix::sys::signal::Signal;
 use nix::sys::signalfd::siginfo;
-// use nix::unistd::Pid;
+use nix::unistd::Pid;
 use std::cell::Ref;
 
 
@@ -9,9 +9,10 @@ pub enum UnixEvent<'a> {
     // PtyMaster(&'a [u8]),
     // Stdin(&'a [u8]),
     // Signal(Signal, &'a siginfo),
-    Stdin(Ref<'a, [u8]>),
-    PtyMaster(Ref<'a, [u8]>),
-    Signal(Signal, Ref<'a, siginfo>),
+    Stdin(usize, Ref<'a, [u8]>),
+    PtyMaster(usize, Ref<'a, [u8]>),
+    PtySlave(usize, Ref<'a, [u8]>),
+    Signal(usize, Signal, Ref<'a, siginfo>),
         // struct signalfd_siginfo {
         //     uint32_t ssi_signo;    /* Signal number */
         //     int32_t  ssi_errno;    /* Error number (unused) */
