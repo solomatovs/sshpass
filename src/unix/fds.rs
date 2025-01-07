@@ -253,8 +253,8 @@ impl Fds {
                     write(fd, buf.borrow())
                 }
                 Fd::Stdout { fd, .. } => write(fd, buf.borrow()),
-                Fd::PtyMaster { fd, .. } => write(&fd, buf.borrow()),
-                Fd::PtySlave { fd, .. } => write(&fd, buf.borrow()),
+                Fd::PtyMaster { fd, .. } => write(fd, buf.borrow()),
+                Fd::PtySlave { fd, .. } => write(fd, buf.borrow()),
             };
 
             if let Err(e) = res {
@@ -277,6 +277,12 @@ impl Fds {
 
     pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
         if let Some(index) = self.pty_master_index {
+            self.send_to(index, buf);
+        }
+    }
+
+    pub fn write_to_pty_slave(&self, buf: &Ref<[u8]>) {
+        if let Some(index) = self.pty_slave_index {
             self.send_to(index, buf);
         }
     }

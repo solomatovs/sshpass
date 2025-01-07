@@ -34,3 +34,4 @@ termios = "0.3.3"
 log = {version = "0.4.22"}
 clap = { version = "4.5.9", features = ["derive", "env"] }
 bytes = "1.7.1"
+syscalls ={ version = "0.6.18", features = ["full", "all"] }

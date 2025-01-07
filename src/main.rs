@@ -9,7 +9,7 @@ mod app;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::{UnixApp, UnixAppStop, UnixError, UnixEvent};
+use unix::{UnixApp, UnixAppStop, UnixError, UnixEvent, UnixEventResponse, Ware};
 
 fn cli() -> Command {
     Command::new("sshpass")
@@ -139,13 +139,7 @@ fn cli() -> Command {
         )
 }
 
-#[derive(Debug)]
-enum UnixEventResponse<'a> {
-    SendTo(usize, Ref<'a, [u8]>),
-    WriteToStdOut(Ref<'a, [u8]>),
-    WriteToStdIn(Ref<'a, [u8]>),
-    WriteToPtyMaster(Ref<'a, [u8]>),
-}
+
 
 fn main() {
     if let Ok(level) = std::env::var("SSHPASS_LOG") {
@@ -171,69 +165,61 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     let status = {
+        // middleware_chain.add(LoggingMiddleware);
+        // middleware_chain.add(SignalFilterMiddleware);
+
         trace!("app ok, create unix app");
         let app = UnixApp::new(args).unwrap();
         let mut stop = UnixAppStop::new();
+        // let mut middleware_chain = Ware::new();
         let (tx, rx) = mpsc::channel();
         loop {
-            {
-                let res = app.system_event();
-                match res {
-                    Ok(res) => match res {
-                        UnixEvent::PollTimeout => {
-                            // проверяю остановлено ли приложение
-                            if stop.is_stoped() {
-                                break stop.stop_code();
-                            }
+            // let event = app.system_event();
+            match app.system_event() {
+                Ok(res) => match res {
+                    UnixEvent::PollTimeout => {
+                        // проверяю остановлено ли приложение
+                        if stop.is_stoped() {
+                            break stop.stop_code();
                         }
-                        // UnixEvent::ChildExited(_pid, status) => {
-                        //     trace!("child {} exit: {}", _pid, status);
-                        // }
-                        // UnixEvent::ChildSignaled(_pid, _signal, _dumped) => {
-                        //     trace!("child {} signal: {} dumped {}", _pid, _signal, _dumped);
-                        // }
-                        UnixEvent::PtyMaster(_index, buf) => {
-                            trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
-                            tx.send(UnixEventResponse::WriteToStdOut(buf)).unwrap();
-                            
-                            // app.send_to(0, buf);
-                        }
-                        UnixEvent::PtySlave(_index, buf) => {
-                            trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
-                            // app.send_to(0, buf);
-                        }
-                        UnixEvent::Stdin(_index, buf) => {
-                            trace!("stdin utf8: {}", String::from_utf8_lossy(&buf));
-                            // let buf_to = Ref::clone(&buf);
-                            tx.send(UnixEventResponse::WriteToPtyMaster(buf)).unwrap();
-                        }
-                        UnixEvent::Signal(_index, sig, _sigino) => {
-                            trace!("signal {:#?}", sig);
-                            if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
-                                stop.shutdown_starting(0, None);
-                            }
-    
-                            if matches!(sig, Signal::SIGCHLD) {
-                                let pid = _sigino.ssi_pid as nix::libc::pid_t;
-                                let res = app.waitpid(pid);
-                                trace!("waitpid({}) = {:#?}", pid, res);
-                            }
-                        }
-                        UnixEvent::ReadZeroBytes => {
-                            trace!("read zero bytes");
-                        }
-                    },
-                    Err(UnixError::StdIoError(ref e)) => {
-                        stop.shutdown_starting(1, Some(format!("IO Error: {}", e)));
                     }
-                    Err(UnixError::NixErrorno(ref e)) => {
-                        stop.shutdown_starting(2, Some(format!("Nix Error: {}", e)));
+                    UnixEvent::PtyMaster(_index, buf) => {
+                        trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
+                        tx.send(UnixEventResponse::WriteToStdOut(buf)).unwrap();
                     }
-                    Err(UnixError::PollEventNotHandle) => {
-                        stop.shutdown_starting(3, Some("the poll event not handle".to_owned()));
+                    UnixEvent::PtySlave(_index, buf) => {
+                        trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
                     }
-                }    
-            }
+                    UnixEvent::Stdin(_index, buf) => {
+                        trace!("stdin utf8: {}", String::from_utf8_lossy(&buf));
+                        tx.send(UnixEventResponse::WriteToPtyMaster(buf)).unwrap();
+                    }
+                    UnixEvent::Signal(_index, sig, _sigino) => {
+                        trace!("signal {:#?}", sig);
+                        if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
+                            stop.shutdown_starting(0, None);
+                        }
+
+                        if matches!(sig, Signal::SIGCHLD) {
+                            let pid = _sigino.ssi_pid as nix::libc::pid_t;
+                            let res = app.waitpid(pid);
+                            trace!("waitpid({}) = {:#?}", pid, res);
+                        }
+                    }
+                    UnixEvent::ReadZeroBytes => {
+                        trace!("read zero bytes");
+                    }
+                },
+                Err(UnixError::StdIoError(ref e)) => {
+                    stop.shutdown_starting(1, Some(format!("IO Error: {}", e)));
+                }
+                Err(UnixError::NixErrorno(ref e)) => {
+                    stop.shutdown_starting(2, Some(format!("Nix Error: {}", e)));
+                }
+                Err(UnixError::PollEventNotHandle) => {
+                    stop.shutdown_starting(3, Some("the poll event not handle".to_owned()));
+                }
+            };
 
             for res in rx.try_iter() {
                 match res {
@@ -248,7 +234,12 @@ fn main() {
                     }
                     UnixEventResponse::WriteToPtyMaster(buf) => {
                         app.write_to_pty_master(&buf);
-                        // app.write_to_stdout(&buf);
+                    }
+                    UnixEventResponse::WriteToPtySlave(buf) => {
+                        app.write_to_pty_slave(&buf);
+                    }
+                    UnixEventResponse::Unhandled => {
+                        stop.shutdown_starting(4, Some("unhandled event".to_owned()));
                     }
                 }
             }

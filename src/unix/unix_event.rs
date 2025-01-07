@@ -38,8 +38,6 @@ pub enum UnixEvent<'a> {
         // };
     ReadZeroBytes,
     PollTimeout,
-    // ChildExited(Pid, i32),
-    // ChildSignaled(Pid, Signal, bool),
 }
 
 impl std::fmt::Display for UnixEvent<'_> {
@@ -65,3 +63,19 @@ impl std::fmt::Display for UnixEvent<'_> {
 //         UnixEvent::WaitStatus(e)
 //     }
 // }
+
+#[derive(Debug)]
+pub enum UnixEventResponse<'a> {
+    Unhandled,
+    SendTo(usize, Ref<'a, [u8]>),
+    WriteToStdOut(Ref<'a, [u8]>),
+    WriteToStdIn(Ref<'a, [u8]>),
+    WriteToPtyMaster(Ref<'a, [u8]>),
+    WriteToPtySlave(Ref<'a, [u8]>),
+}
+
+impl std::fmt::Display for UnixEventResponse<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UnixEventResponse")
+    }
+}

@@ -635,6 +635,10 @@ impl UnixApp {
     pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
         self.poller.fds.write_to_pty_master(buf);
     }
+
+    pub fn write_to_pty_slave(&self, buf: &Ref<[u8]>) {
+        self.poller.fds.write_to_pty_slave(buf);
+    }
 }
 
 impl Drop for UnixApp {
