@@ -1,5 +1,5 @@
 use std::borrow::{Borrow, BorrowMut};
-use std::io::{Stdin, Stdout};
+use std::io::{Stdin, StdinLock, Stdout};
 // use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::cell::{Ref, RefCell, RefMut};
@@ -23,7 +23,7 @@ pub enum Fd {
         events: PollFlags,
     },
     Stdin {
-        fd: Stdin,
+        fd: StdinLock<'static>,
         events: PollFlags,
         termios: Termios,
     },
@@ -183,7 +183,7 @@ impl Fds {
             fd: pty_fd.slave,
             events,
         });
-        self.pty_master_index = Some(self.inner.len() - 1);
+        self.pty_slave_index = Some(self.inner.len() - 1);
     }
 
     /// Добавляет дескриптор сигнала в список файловых дескрипторов
@@ -202,7 +202,7 @@ impl Fds {
     }
 
     /// Добавляет дескриптор stdin в список файловых дескрипторов
-    pub fn push_stdin_fd(&mut self, stdin: Stdin, termios: Termios, events: PollFlags) {
+    pub fn push_stdin_fd(&mut self, stdin: StdinLock<'static>, termios: Termios, events: PollFlags) {
         self._push_fd(Fd::Stdin {
             fd: stdin,
             termios,

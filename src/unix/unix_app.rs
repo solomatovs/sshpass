@@ -1,7 +1,7 @@
 use std::borrow::{Borrow, BorrowMut};
 use std::boxed::Box;
 use std::cell::{Ref, RefCell};
-use std::io::Stdin;
+use std::io::{Stdin, StdinLock};
 use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
@@ -229,12 +229,10 @@ impl UnixApp {
         status
     }
 
-    pub fn set_non_canonical_stdin() -> Result<(), UnixError> {
-        let stdin = std::io::stdin();
-        let lock = stdin.lock();
-        let mut termios_modify = get_termios(lock.as_raw_fd())?;
+    pub fn set_non_canonical_stdin(stdin: &mut StdinLock) -> Result<(), UnixError> {
+        let mut termios_modify = get_termios(stdin.as_raw_fd())?;
         set_keypress_mode(&mut termios_modify);
-        set_termios(lock.as_raw_fd(), &termios_modify)?;
+        set_termios(stdin.as_raw_fd(), &termios_modify)?;
 
         Ok(())
     }
@@ -242,12 +240,14 @@ impl UnixApp {
     pub fn reg_non_canonical_stdin(&mut self) -> Result<(), UnixError> {
         // перевожу stdin в режим non canonical для побайтовой обработки вводимых данных
         // добавляю в контейнер fds для дальнейшего отслеживания событий через poll
-        let termios = get_termios(std::io::stdin().lock().as_raw_fd())?;
+        let mut stdin = std::io::stdin().lock();
+        let termios = get_termios(stdin.as_raw_fd())?;
 
-        Self::set_non_canonical_stdin()?;
+        Self::set_non_canonical_stdin(&mut stdin)?;
+
         self.poller
             .fds
-            .push_stdin_fd(std::io::stdin(), termios, PollFlags::POLLIN);
+            .push_stdin_fd(stdin, termios, PollFlags::POLLIN);
 
         Ok(())
     }
@@ -553,7 +553,7 @@ impl UnixApp {
         }
     }
 
-    fn match_stdin_event(&self, index: usize, fd: &Stdin) -> Result<UnixEvent, UnixError> {
+    fn match_stdin_event(&self, index: usize, fd: &StdinLock<'static>) -> Result<UnixEvent, UnixError> {
         let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
         match res {
             Err(e) => {
