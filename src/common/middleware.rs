@@ -1,43 +1,15 @@
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 
-pub type WareArg<'a, T> = RefMut<'a, T>;
-pub type WareArgBox<T> = Box<dyn Fn(WareArg<T>)>;
-pub type WareArgVec<T> = Vec<WareArgBox<T>>;
-
-/// A middleware chain.
-pub struct Ware<T> {
-    pub fns: WareArgVec<T>,
+#[derive(Debug)]
+pub struct MiddlewareBase<V, R> {
+    inner: fn(V) -> R,
 }
 
-impl<T> Ware<T> {
-    pub fn new() -> Ware<T> {
-        let vec = Vec::new();
-        Ware { fns: vec }
-    }
-
-    pub fn wrap(&mut self, func: WareArgBox<T>) {
-        self.fns.push(func);
-    }
-
-
-    pub fn run(&self, arg: T) -> T {
-        let ware_arg = RefCell::new(arg);
-
-        self.fns.iter().for_each(|func| {
-            let res = func(ware_arg.borrow_mut());
-            res
-        });
-
-        ware_arg.into_inner()
+impl<V, R> MiddlewareBase<V, R> {
+    pub fn handle(&self, value: V) -> R {
+        (self.inner)(value)
     }
 }
-
-
-
-
-
-
-
 
 use std::rc::Rc;
 
@@ -69,7 +41,7 @@ impl<V: 'static, R: 'static> Manager<V, R> {
     }
 
     /// Start processing the value
-    pub async fn send(&self, value: V) -> R {
+    pub fn send(&self, value: V) -> R {
         let total = self.list.borrow().len();
 
         let qq = Rc::clone(&self.list);
@@ -107,7 +79,7 @@ pub struct Next<V, R> {
 }
 
 impl<V, R> Next<V, R> {
-    pub async fn call(mut self, value: V) -> R {
+    pub fn call(mut self, value: V) -> R {
         let list = Rc::clone(&self.list);
         self.next -= 1;
         if let Some(next) = list.borrow().get(self.next) {

@@ -5,9 +5,6 @@ use std::cell::Ref;
 
 #[derive(Debug)]
 pub enum UnixEvent<'a> {
-    // PtyMaster(&'a [u8]),
-    // Stdin(&'a [u8]),
-    // Signal(Signal, &'a siginfo),
     Stdin(usize, Ref<'a, [u8]>),
     PtyMaster(usize, Ref<'a, [u8]>),
     PtySlave(usize, Ref<'a, [u8]>),
@@ -38,6 +35,9 @@ pub enum UnixEvent<'a> {
         // };
     ReadZeroBytes,
     PollTimeout,
+    StdIoError(std::io::Error),
+    NixErrorno(nix::errno::Errno),
+    PollEventNotHandle,
 }
 
 impl std::fmt::Display for UnixEvent<'_> {
@@ -46,17 +46,17 @@ impl std::fmt::Display for UnixEvent<'_> {
     }
 }
 
-// impl From<std::io::Error> for UnixEvent<'_> {
-//     fn from(e: std::io::Error) -> Self {
-//         UnixEvent::StdIoError(e)
-//     }
-// }
+impl From<std::io::Error> for UnixEvent<'_> {
+    fn from(e: std::io::Error) -> Self {
+        UnixEvent::StdIoError(e)
+    }
+}
 
-// impl From<nix::errno::Errno> for UnixEvent<'_> {
-//     fn from(e: nix::errno::Errno) -> Self {
-//         UnixEvent::NixErrorno(e)
-//     }
-// }
+impl From<nix::errno::Errno> for UnixEvent<'_> {
+    fn from(e: nix::errno::Errno) -> Self {
+        UnixEvent::NixErrorno(e)
+    }
+}
 
 // impl<'a> From<WaitStatus> for UnixEvent<'a> {
 //     fn from(e: WaitStatus) -> Self {

@@ -2,12 +2,15 @@ use std::borrow::{Borrow, BorrowMut};
 use std::boxed::Box;
 use std::cell::{Ref, RefCell};
 use std::io::{Stdin, StdinLock};
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
+use std::rc::Rc;
 use std::time::Instant;
 
+use flexi_logger::LoggerHandle;
 use nix::errno::Errno::EAGAIN;
 use nix::pty::{openpty, OpenptyResult};
 use nix::sys::signal::{SigSet, Signal};
@@ -30,9 +33,19 @@ use clap::parser::ValuesRef;
 use clap::ArgMatches;
 use log::{error, trace};
 
+use crate::common::{AppContext, Handler};
 use crate::unix::fds::{Fd, Poller};
 use crate::unix::unix_error::UnixError;
 use crate::unix::unix_event::UnixEvent;
+use crate::unix::unix_event::UnixEventResponse;
+use crate::unix::modules::{
+    LoggingMiddleware,
+    SignalfdMiddleware,
+    ZeroBytesMiddleware,
+    PtyMiddleware,
+    PollTimeoutMiddleware,
+    StdMiddleware,
+};
 
 // Флаг          Значение
 // ISIG          Разрешить посылку сигналов
@@ -129,10 +142,12 @@ impl Buffer {
     }
 }
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct UnixApp {
     poller: Poller,
     buf: Buffer,
+    event_handlers: Box<dyn Handler<UnixEvent<'static>, UnixEventResponse<'static>>>,
+    pub context: Rc<RefCell<AppContext>>,
 }
 
 impl UnixApp {
@@ -141,6 +156,8 @@ impl UnixApp {
         let mut res = Self {
             poller: Poller::new(PollTimeout::from(200_u16)),
             buf: Buffer::new(4096),
+            context: Rc::new(RefCell::new(AppContext::default())),
+            event_handlers: Box::new(LoggingMiddleware::new()),
         };
 
         res.reg_signals()?;
@@ -153,7 +170,23 @@ impl UnixApp {
 
         res.reg_stdout()?;
 
+        // res.reg_event_handlers()?;
+
         Ok(res)
+    }
+
+    pub fn reg_event_handlers(
+        &mut self,
+    ) -> Result<(), UnixError> {
+        // Регистрируем обработчики событий
+        // let context = Rc::clone(&self.context);
+        // let res = SignalfdMiddleware::new(context.take());
+        // let res = *self.event_handlers.next(Box::new());
+        // res;
+
+        todo!();
+        
+        Ok(())
     }
     pub fn reg_pty_child(
         &mut self,
@@ -260,15 +293,6 @@ impl UnixApp {
         Ok(())
     }
 
-    // pub fn set_termios_stdin(termios: &Termios) -> Result<(), UnixError> {
-    //     let stdin = std::io::stdin();
-    //     let lock = stdin.lock();
-
-    //     set_termios(lock.as_raw_fd(), &termios)?;
-
-    //     Ok(())
-    // }
-
     pub fn reg_signals(&mut self) -> Result<(), UnixError> {
         let mut mask = SigSet::empty();
         // добавляю в обработчик все сигналы
@@ -280,8 +304,6 @@ impl UnixApp {
         for s in mask.into_iter() {
             new_mask.add(s);
         }
-
-        // self.poller.borrow_mut().remove_signal_fd();
 
         new_mask.thread_block()?;
 
@@ -311,60 +333,6 @@ impl UnixApp {
         trace!("deinit fds");
 
         Ok(())
-    }
-
-    pub fn waitpid(&self, pid: nix::libc::pid_t) -> nix::Result<WaitStatus> {
-        trace!("check child process {} is running...", pid);
-        let pid = Pid::from_raw(pid);
-        let options = Some(
-            WaitPidFlag::WNOHANG
-                | WaitPidFlag::WSTOPPED
-                | WaitPidFlag::WCONTINUED
-                | WaitPidFlag::WUNTRACED,
-        );
-
-        waitpid(pid, options)
-
-        // match waitpid(pid, options) {
-        //     Err(e) => {
-        //         error!("waitpid error: {}", e);
-        //         return Err(e.into());
-        //     }
-        //     Ok(WaitStatus::Exited(pid, status)) => {
-        //         info!("WaitStatus::Exited(pid: {:?}, status: {:?}", pid, status);
-        //         return Ok(UnixEvent::ChildExited(pid, status));
-        //     }
-        //     Ok(WaitStatus::Signaled(pid, sig, _dumped)) => {
-        //         info!(
-        //             "WaitStatus::Signaled(pid: {:?}, sig: {:?}, dumped: {:?})",
-        //             pid, sig, _dumped
-        //         );
-
-        //         return Ok(UnixEvent::ChildSignaled(pid, sig, _dumped));
-        //     }
-        //     Ok(WaitStatus::Stopped(pid, sig)) => {
-        //         debug!("WaitStatus::Stopped(pid: {:?}, sig: {:?})", pid, sig);
-        //     }
-        //     Ok(WaitStatus::StillAlive) => {
-        //         trace!("WaitStatus::StillAlive");
-        //     }
-        //     Ok(WaitStatus::Continued(pid)) => {
-        //         trace!("WaitStatus::Continued(pid: {:?})", pid);
-        //     }
-        //     Ok(WaitStatus::PtraceEvent(pid, sig, c)) => {
-        //         trace!(
-        //             "WaitStatus::PtraceEvent(pid: {:?}, sig: {:?}, c: {:?})",
-        //             pid,
-        //             sig,
-        //             c
-        //         );
-        //     }
-        //     Ok(WaitStatus::PtraceSyscall(pid)) => {
-        //         trace!("WaitStatus::PtraceSyscall(pid: {:?})", pid);
-        //     }
-        // }
-
-        // None
     }
 
     // match Signal::try_from(sig.ssi_signo as i32) {
@@ -466,18 +434,18 @@ impl UnixApp {
         })
     }
 
-    fn match_signal_event(&self, index: usize, fd: &SignalFd) -> Result<UnixEvent, UnixError> {
+    fn match_signal_event(&self, index: usize, fd: &SignalFd) -> UnixEvent {
         let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
         match res {
             Err(e) => {
                 // error
                 trace!("signal match Err({:?})", e);
-                Err(e.into())
+                e.into()
             }
             Ok(0) => {
                 // EOF
                 trace!("signal match Ok(0) bytes");
-                Ok(UnixEvent::ReadZeroBytes)
+                UnixEvent::ReadZeroBytes
             }
             Ok(n) => {
                 // read n bytes
@@ -489,12 +457,12 @@ impl UnixApp {
                 let signal = Signal::try_from(res.ssi_signo as i32);
                 if let Err(e) = signal {
                     error!("Error converting received bytes to the Signal struct: {e}");
-                    return Err(e.into());
+                    return e.into();
                 }
 
                 let signal = signal.unwrap();
                 let res = UnixEvent::Signal(index, signal, res);
-                Ok(res)
+                res
             }
         }
     }
@@ -503,25 +471,25 @@ impl UnixApp {
         &self,
         index: usize,
         fd: &OwnedFd,
-    ) -> Result<UnixEvent, UnixError> {
+    ) -> UnixEvent {
         let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
         match res {
             Err(e) => {
                 // error
                 trace!("pty match Err({:?})", e);
-                Err(e.into())
+                e.into()
             }
             Ok(0) => {
                 // EOF
                 trace!("pty match Ok(0) bytes");
-                Ok(UnixEvent::ReadZeroBytes)
+                UnixEvent::ReadZeroBytes
             }
             Ok(n) => {
                 // read n bytes
                 trace!("pty match Ok({n}) bytes");
                 let buf = self.buf.get_slice_len(n);
                 let res = UnixEvent::PtyMaster(index, buf);
-                Ok(res)
+                res
             }
         }
     }
@@ -530,63 +498,63 @@ impl UnixApp {
         &self,
         index: usize,
         fd: &OwnedFd,
-    ) -> Result<UnixEvent, UnixError> {
+    ) -> UnixEvent {
         let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
         match res {
             Err(e) => {
                 // error
                 trace!("pty match Err({:?})", e);
-                Err(e.into())
+                e.into()
             }
             Ok(0) => {
                 // EOF
                 trace!("pty match Ok(0) bytes");
-                Ok(UnixEvent::ReadZeroBytes)
+                UnixEvent::ReadZeroBytes
             }
             Ok(n) => {
                 // read n bytes
                 trace!("pty match Ok({n}) bytes");
                 let buf = self.buf.get_slice_len(n);
                 let res = UnixEvent::PtySlave(index, buf);
-                Ok(res)
+                res
             }
         }
     }
 
-    fn match_stdin_event(&self, index: usize, fd: &StdinLock<'static>) -> Result<UnixEvent, UnixError> {
+    fn match_stdin_event(&self, index: usize, fd: &StdinLock<'static>) -> UnixEvent {
         let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
         match res {
             Err(e) => {
                 // error
                 trace!("stdin match Err({:?})", e);
-                Err(e.into())
+                e.into()
             }
             Ok(0) => {
                 // EOF
                 trace!("stdin match Ok(0) bytes");
-                Ok(UnixEvent::ReadZeroBytes)
+                UnixEvent::ReadZeroBytes
             }
             Ok(n) => {
                 // read n bytes
                 trace!("stdin match Ok({n}) bytes");
                 let buf = self.buf.get_slice_len(n);
                 let res = UnixEvent::Stdin(index, buf);
-                Ok(res)
+                res
             }
         }
     }
 
-    pub fn system_event(&self) -> Result<UnixEvent, UnixError> {
+    pub fn system_event(&self) -> UnixEvent {
         trace!("poll(&mut fds, {:?})", self.poller.poll_timeout);
         match self.poller.poll() {
             Err(e) => {
                 error!("poll calling error: {}", e);
-                return Err(e.into());
+                return e.into();
             }
             Ok(0) => {
                 // timeout
                 // trace!("poll timeout: Ok(0)");
-                return Ok(UnixEvent::PollTimeout);
+                return UnixEvent::PollTimeout;
             }
             Ok(n) => {
                 // match n events
@@ -617,7 +585,7 @@ impl UnixApp {
             }
         }
 
-        Err(UnixError::PollEventNotHandle)
+        UnixEvent::PollEventNotHandle
     }
 
     pub fn send_to(&self, index: usize, buf: &Ref<[u8]>) {
@@ -646,59 +614,5 @@ impl Drop for UnixApp {
         if let Err(e) = self.deinit() {
             error!("deinit error: {:#?}", e);
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct UnixAppStop {
-    is_stoped: bool,
-    is_stop: bool,
-    stop_time: Option<Instant>,
-    stop_code: Option<i32>,
-    stop_error: Option<String>,
-}
-
-impl UnixAppStop {
-    pub fn new() -> Self {
-        Self {
-            is_stoped: false,
-            is_stop: false,
-            stop_time: None,
-            stop_code: None,
-            stop_error: None,
-        }
-    }
-
-    pub fn is_stop(&self) -> bool {
-        self.is_stop
-    }
-
-    pub fn is_stoped(&self) -> bool {
-        self.is_stoped
-    }
-
-    pub fn shutdown_starting(&mut self, stop_code: i32, error: Option<String>) {
-        self.stop_time = Some(Instant::now());
-        self.is_stop = true;
-        self.is_stoped = false;
-        self.stop_code = Some(stop_code);
-        self.stop_error = error;
-    }
-
-    pub fn shutdown_complited(&mut self) {
-        self.is_stop = false;
-        self.is_stoped = true;
-    }
-
-    pub fn shutdown_cancel(&mut self) {
-        self.is_stop = false;
-        self.is_stoped = false;
-        self.stop_time = None;
-        self.stop_code = None;
-        self.stop_error = None;
-    }
-
-    pub fn stop_code(&self) -> i32 {
-        self.stop_code.unwrap_or(255)
     }
 }

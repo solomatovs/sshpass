@@ -4,7 +4,7 @@ use std::fmt;
 pub enum UnixError {
     StdIoError(std::io::Error),
     NixErrorno(nix::errno::Errno),
-    PollEventNotHandle,
+    // PollEventNotHandle,
     // FdReadOnly,
     // FdNotFound,
 }
