@@ -1,17 +1,26 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::common::Handler;
+use crate::common::{Handler, AppContext};
 use crate::unix::{UnixEvent, UnixEventResponse};
+use super::EventMiddlewareType;
 use log::trace;
 
 
-pub struct PtyMiddleware<UnixEvent, UnixEventResponse> {
-    next: Option<Rc<RefCell<dyn Handler<UnixEvent, UnixEventResponse>>>>,
+pub struct PtyMiddleware<'a> {
+    next: Option<Rc<RefCell<EventMiddlewareType<'a>>>>,
 }
 
-impl<'a> Handler<UnixEvent<'a>, UnixEventResponse<'a>>  for PtyMiddleware<UnixEvent<'a>, UnixEventResponse<'a>>  {
-    fn handle(&mut self, value: UnixEvent<'a>) -> UnixEventResponse<'a> {
+impl<'a> PtyMiddleware<'a>  {
+    pub fn new() -> Self {
+        Self {
+            next: None,
+        }
+    }
+}
+
+impl<'a> Handler<&'a mut AppContext, UnixEvent<'a>, UnixEventResponse<'a>> for PtyMiddleware<'a>  {
+    fn handle(&mut self, context: &'a mut AppContext, value: UnixEvent<'a>) -> UnixEventResponse<'a> {
         trace!("pty middleware");
 
         if let UnixEvent::Stdin(_index, buf) = value {
@@ -20,7 +29,7 @@ impl<'a> Handler<UnixEvent<'a>, UnixEventResponse<'a>>  for PtyMiddleware<UnixEv
         }
         
         if let Some(ref next) = self.next {
-            return Rc::clone(next).borrow_mut().handle(value);
+            return Rc::clone(next).borrow_mut().handle(context, value);
         }
         
         UnixEventResponse::Unhandled

@@ -1,5 +1,6 @@
 use crate::common::{AppContext, Handler};
 use crate::unix::{UnixEvent, UnixEventResponse};
+use super::EventMiddlewareType;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,12 +12,17 @@ use nix::sys::signal::Signal;
 use log::{trace, error, debug, info};
 
 
-pub struct SignalfdMiddleware<UnixEvent, UnixEventResponse> {
-    next: Option<Rc<RefCell<dyn Handler<UnixEvent, UnixEventResponse>>>>,
-    context: AppContext,
+pub struct SignalfdMiddleware<'a> {
+    next: Option<Rc<RefCell<EventMiddlewareType<'a>>>>,
 }
 
-impl <'a> SignalfdMiddleware<UnixEvent<'a>, UnixEventResponse<'a>> {
+impl <'a> SignalfdMiddleware<'a> {
+    pub fn new() -> Self {
+        Self {
+            next: None,
+        }
+    }
+
     pub fn waitpid(&self, pid: nix::libc::pid_t) -> nix::Result<WaitStatus> {
         trace!("check child process {} is running...", pid);
         let pid = Pid::from_raw(pid);
@@ -68,8 +74,8 @@ impl <'a> SignalfdMiddleware<UnixEvent<'a>, UnixEventResponse<'a>> {
     }
 }
 
-impl<'a> Handler<UnixEvent<'a>, UnixEventResponse<'a>>  for SignalfdMiddleware<UnixEvent<'a>, UnixEventResponse<'a>>  {
-    fn handle(&mut self, value: UnixEvent<'a>) -> UnixEventResponse<'a> {
+impl<'a> Handler<&'a mut AppContext, UnixEvent<'a>, UnixEventResponse<'a>> for SignalfdMiddleware<'a>  {
+    fn handle(&mut self, context: &'a mut AppContext, value: UnixEvent<'a>) -> UnixEventResponse<'a> {
         trace!("signalfd middleware");
 
         let mut res = UnixEventResponse::Unhandled;
@@ -77,7 +83,7 @@ impl<'a> Handler<UnixEvent<'a>, UnixEventResponse<'a>>  for SignalfdMiddleware<U
         if let UnixEvent::Signal(_index, sig, _sigino) = &value {
             trace!("signal {:#?}", sig);
             if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
-                self.context.shutdown.shutdown_starting(0, None);
+                context.shutdown.shutdown_starting(0, None);
             }
 
             if matches!(sig, Signal::SIGCHLD) {
@@ -88,7 +94,7 @@ impl<'a> Handler<UnixEvent<'a>, UnixEventResponse<'a>>  for SignalfdMiddleware<U
         }
 
         if let Some(ref next) = self.next {
-            res = Rc::clone(next).borrow_mut().handle(value);
+            res = Rc::clone(next).borrow_mut().handle(context, value);
         }
         
         res

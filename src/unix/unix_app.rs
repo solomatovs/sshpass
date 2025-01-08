@@ -40,12 +40,14 @@ use crate::unix::unix_event::UnixEvent;
 use crate::unix::unix_event::UnixEventResponse;
 use crate::unix::modules::{
     LoggingMiddleware,
-    SignalfdMiddleware,
-    ZeroBytesMiddleware,
-    PtyMiddleware,
-    PollTimeoutMiddleware,
-    StdMiddleware,
+    // SignalfdMiddleware,
+    // ZeroBytesMiddleware,
+    // PtyMiddleware,
+    // PollTimeoutMiddleware,
+    // StdMiddleware,
 };
+
+use super::EventMiddlewareType;
 
 // Флаг          Значение
 // ISIG          Разрешить посылку сигналов
@@ -146,7 +148,7 @@ impl Buffer {
 pub struct UnixApp {
     poller: Poller,
     buf: Buffer,
-    event_handlers: Box<dyn Handler<UnixEvent<'static>, UnixEventResponse<'static>>>,
+    event_handlers: Box<EventMiddlewareType<'static>>,
     pub context: Rc<RefCell<AppContext>>,
 }
 
