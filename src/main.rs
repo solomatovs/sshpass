@@ -1,15 +1,14 @@
 use clap::{Arg, ArgGroup, Command};
+use common::Handler;
 use log::trace;
-use nix::sys::signal::Signal;
-use std::cell::Ref;
-use std::sync::mpsc;
-use std::{cell::RefCell, str::FromStr};
+use std::str::FromStr;
+use unix::LoggingMiddleware;
 
 mod app;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::{UnixApp, UnixEvent, UnixEventResponse};
+use unix::UnixApp;
 mod common;
 
 fn cli() -> Command {
@@ -165,13 +164,17 @@ fn main() {
     #[cfg(target_os = "linux")]
     let status = {
         trace!("app ok, create unix app");
-        let app = UnixApp::new(args).unwrap();
+        let mut app = UnixApp::new(args).unwrap();
+        let mut handle = LoggingMiddleware::new();
 
-        while !app.context.borrow().shutdown.is_stop() {
-            let _event = app.system_event();
+        while !app.context.shutdown.is_stop() {
+            let event = app.event_system();
+            // let context = &mut app.context;
+            // handle.handle(&mut app.context, event);
+            // app.event_handler(event);
         }
 
-        let exit_code = app.context.borrow().shutdown.stop_code();
+        let exit_code = app.context.shutdown.stop_code();
         trace!("app exit with code {}", exit_code);
         exit_code
     };

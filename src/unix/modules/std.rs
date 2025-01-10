@@ -3,15 +3,15 @@ use std::rc::Rc;
 
 use crate::common::{Handler, AppContext};
 use crate::unix::{UnixEvent, UnixEventResponse};
-use super::EventMiddlewareType;
+use super::EventMiddlewareNext;
 use log::trace;
 
 
 pub struct StdMiddleware<'a> {
-    next: Option<Rc<RefCell<EventMiddlewareType<'a>>>>,
+    next: EventMiddlewareNext<'a> ,
 }
 
-impl<'a> StdMiddleware<'a>  {
+impl StdMiddleware<'_>  {
     pub fn new() -> Self {
         Self {
             next: None,

@@ -35,9 +35,6 @@ use log::{error, trace};
 
 use crate::common::{AppContext, Handler};
 use crate::unix::fds::{Fd, Poller};
-use crate::unix::unix_error::UnixError;
-use crate::unix::unix_event::UnixEvent;
-use crate::unix::unix_event::UnixEventResponse;
 use crate::unix::modules::{
     LoggingMiddleware,
     // SignalfdMiddleware,
@@ -46,6 +43,9 @@ use crate::unix::modules::{
     // PollTimeoutMiddleware,
     // StdMiddleware,
 };
+use crate::unix::unix_error::UnixError;
+use crate::unix::unix_event::UnixEvent;
+use crate::unix::unix_event::UnixEventResponse;
 
 use super::EventMiddlewareType;
 
@@ -124,23 +124,40 @@ pub fn _set_termsize(fd: i32, mut size: nix::libc::winsize) -> std::io::Result<(
 
 #[derive(Debug)]
 pub struct Buffer {
-    buf: RefCell<Vec<u8>>,
+    // buf: RefCell<Vec<u8>>,
+    buf: Vec<u8>,
 }
 
 impl Buffer {
     pub fn new(size: usize) -> Self {
         Self {
-            buf: RefCell::new(vec![0; size]),
+            // buf: RefCell::new(vec![0; size]),
+            buf: vec![0; size],
         }
     }
 
-    pub fn get_slice_len(&self, len: usize) -> std::cell::Ref<[u8]> {
-        std::cell::Ref::map(self.buf.borrow(), |vec| &vec[..len])
+    // pub fn get_slice_len(&self, len: usize) -> std::cell::Ref<[u8]> {
+    //     std::cell::Ref::map(self.buf.borrow(), |vec| &vec[..len])
+    // }
+
+    // /// Получает изменяемый срез
+    // pub fn get_mut_slice(&self) -> std::cell::RefMut<[u8]> {
+    //     std::cell::RefMut::map(self.buf.borrow_mut(), |vec| vec.as_mut_slice())
+    // }
+
+    pub fn get_slice_len(&self, len: usize) -> &[u8] {
+        &self.buf[..len]
     }
 
     /// Получает изменяемый срез
-    pub fn get_mut_slice(&self) -> std::cell::RefMut<[u8]> {
-        std::cell::RefMut::map(self.buf.borrow_mut(), |vec| vec.as_mut_slice())
+    pub fn get_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        // std::cell::RefMut::map(self.buf.borrow_mut(), |vec| vec.as_mut_slice())
+        &mut self.buf[..len]
+    }
+
+    pub fn get_mut_all_slice(&mut self) -> &mut [u8] {
+        // std::cell::RefMut::map(self.buf.borrow_mut(), |vec| vec.as_mut_slice())
+        &mut self.buf
     }
 }
 
@@ -148,8 +165,7 @@ impl Buffer {
 pub struct UnixApp {
     poller: Poller,
     buf: Buffer,
-    event_handlers: Box<EventMiddlewareType<'static>>,
-    pub context: Rc<RefCell<AppContext>>,
+    pub context: AppContext,
 }
 
 impl UnixApp {
@@ -158,8 +174,7 @@ impl UnixApp {
         let mut res = Self {
             poller: Poller::new(PollTimeout::from(200_u16)),
             buf: Buffer::new(4096),
-            context: Rc::new(RefCell::new(AppContext::default())),
-            event_handlers: Box::new(LoggingMiddleware::new()),
+            context: AppContext::default(),
         };
 
         res.reg_signals()?;
@@ -177,9 +192,7 @@ impl UnixApp {
         Ok(res)
     }
 
-    pub fn reg_event_handlers(
-        &mut self,
-    ) -> Result<(), UnixError> {
+    pub fn reg_event_handlers(&mut self) -> Result<(), UnixError> {
         // Регистрируем обработчики событий
         // let context = Rc::clone(&self.context);
         // let res = SignalfdMiddleware::new(context.take());
@@ -187,7 +200,7 @@ impl UnixApp {
         // res;
 
         todo!();
-        
+
         Ok(())
     }
     pub fn reg_pty_child(
@@ -244,9 +257,7 @@ impl UnixApp {
             Ok(ForkResult::Parent { child }) => {
                 // эта исполняется только в родительском процессе
                 // возвращаю pty дескриптор для отслеживания событий через poll
-                self.poller
-                    .fds
-                    .push_pty_fd(pty, child, PollFlags::POLLIN);
+                self.poller.fds.push_pty_fd(pty, child, PollFlags::POLLIN);
 
                 Ok(())
             }
@@ -394,10 +405,15 @@ impl UnixApp {
     /// Если poll сигнализирует что событие есть, то нужно вызвать эту функцию
     /// Что бы прочитать событие, иначе при следующем вызове poll
     /// он опять сигнализирует о том, что событие есть и оно не прочитано
-    fn read_event(fd: RawFd, buf: &mut [u8]) -> Result<usize, nix::errno::Errno> {
-        trace!("try read({:?}, buf)", fd);
+    fn read_event(fd: &mut Fd, buf: &mut [u8]) -> Result<usize, nix::errno::Errno> {
+        trace!("fd reading ({:?})", fd);
 
-        let res = { read(fd, buf) };
+        let res = match fd {
+            Fd::Stdin {..} | Fd::Stdout {..} | Fd::PtyMaster { .. } | Fd::Stdout { .. } | Fd::PtySlave { .. } | Fd::Signal { .. } => {
+                { read(fd.as_raw_fd(), buf) }
+            }
+        };
+        
         match res {
             Err(EAGAIN) => {
                 // non block
@@ -425,138 +441,149 @@ impl UnixApp {
         }
     }
 
-    fn map_ref_to_siginfo(bytes: Ref<[u8]>) -> Ref<siginfo> {
-        Ref::map(bytes, |slice| {
-            // Преобразуем срез байт в ссылку на siginfo
-            assert!(
-                slice.len() >= std::mem::size_of::<siginfo>(),
-                "Slice too small"
-            );
-            unsafe { &*(slice.as_ptr() as *const siginfo) }
-        })
+    // fn map_ref_to_siginfo(bytes: Ref<[u8]>) -> Ref<siginfo> {
+    //     Ref::map(bytes, |slice| {
+    //         // Преобразуем срез байт в ссылку на siginfo
+    //         assert!(
+    //             slice.len() >= std::mem::size_of::<siginfo>(),
+    //             "Slice too small"
+    //         );
+    //         unsafe { &*(slice.as_ptr() as *const siginfo) }
+    //     })
+    // }
+    fn map_ref_to_siginfo(bytes: &mut [u8]) -> &mut siginfo {
+            unsafe { &mut *(bytes.as_ptr() as *mut siginfo) }
     }
 
-    fn match_signal_event(&self, index: usize, fd: &SignalFd) -> UnixEvent {
-        let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
-        match res {
-            Err(e) => {
-                // error
-                trace!("signal match Err({:?})", e);
-                e.into()
-            }
-            Ok(0) => {
-                // EOF
-                trace!("signal match Ok(0) bytes");
-                UnixEvent::ReadZeroBytes
-            }
-            Ok(n) => {
-                // read n bytes
-                trace!("signal match Ok({n}) bytes");
-                trace!("try convert to struct siginfo");
-                let buf = self.buf.get_slice_len(n);
-                let res = Self::map_ref_to_siginfo(buf);
+    // fn match_signal_event(&mut self, index: usize, fd: &SignalFd) -> Result<(UnixEvent, &mut AppContext), UnixError> {
+    //     let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_all_slice());
+    //     match res {
+    //         Err(e) => {
+    //             // error
+    //             trace!("signal match Err({:?})", e);
+    //             Err(e.into())
+    //         }
+    //         Ok(0) => {
+    //             // EOF
+    //             trace!("signal match Ok(0) bytes");
+    //             Ok((UnixEvent::ReadZeroBytes, &mut self.context))
+    //         }
+    //         Ok(n) => {
+    //             // read n bytes
+    //             trace!("signal match Ok({n}) bytes");
+    //             trace!("try convert to struct siginfo");
+    //             let buf = self.buf.get_mut_slice(n);
+    //             let res = Self::map_ref_to_siginfo(buf);
 
-                let signal = Signal::try_from(res.ssi_signo as i32);
-                if let Err(e) = signal {
-                    error!("Error converting received bytes to the Signal struct: {e}");
-                    return e.into();
-                }
+    //             let signal = Signal::try_from(res.ssi_signo as i32);
+    //             if let Err(e) = signal {
+    //                 error!("Error converting received bytes to the Signal struct: {e}");
+    //                 return Err(e.into());
+    //             }
 
-                let signal = signal.unwrap();
-                let res = UnixEvent::Signal(index, signal, res);
-                res
-            }
-        }
+    //             let signal = signal.unwrap();
+    //             // let res = *res;
+    //             let res = UnixEvent::Signal(index, signal, res);
+    //             Ok((res, &mut self.context))
+    //         }
+    //     }
+    // }
+
+    // fn match_pty_master_event(&mut self, index: usize, fd: &OwnedFd) -> Result<(UnixEvent, &mut AppContext), UnixError>  {
+    //     let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_all_slice());
+    //     match res {
+    //         Err(e) => {
+    //             // error
+    //             trace!("pty match Err({:?})", e);
+    //             Err(e.into())
+    //         }
+    //         Ok(0) => {
+    //             // EOF
+    //             trace!("pty match Ok(0) bytes");
+    //             Ok((UnixEvent::ReadZeroBytes, &mut self.context))
+    //         }
+    //         Ok(n) => {
+    //             // read n bytes
+    //             trace!("pty match Ok({n}) bytes");
+    //             let buf = self.buf.get_mut_slice(n);
+    //             let res = UnixEvent::PtyMaster(index, buf);
+    //             Ok((res, &mut self.context))
+    //         }
+    //     }
+    // }
+    // fn match_pty_slave_event(&mut self, index: usize, fd: &OwnedFd) -> Result<(UnixEvent, &mut AppContext), UnixError>  {
+    //     let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_all_slice());
+    //     match res {
+    //         Err(e) => {
+    //             // error
+    //             trace!("pty match Err({:?})", e);
+    //             Err(e.into())
+    //         }
+    //         Ok(0) => {
+    //             // EOF
+    //             trace!("pty match Ok(0) bytes");
+    //             Ok((UnixEvent::ReadZeroBytes, &mut self.context))
+    //         }
+    //         Ok(n) => {
+    //             // read n bytes
+    //             trace!("pty match Ok({n}) bytes");
+    //             let buf = self.buf.get_mut_slice(n);
+    //             let res = UnixEvent::PtySlave(index, buf);
+    //             Ok((res, &mut self.context))
+    //         }
+    //     }
+    // }
+    // fn match_stdin_event(&mut self, index: usize, fd: &StdinLock<'static>) -> Result<(UnixEvent, &mut AppContext), UnixError>  {
+    //     let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_all_slice());
+    //     match res {
+    //         Err(e) => {
+    //             // error
+    //             trace!("stdin match Err({:?})", e);
+    //             Err(e.into())
+    //         }
+    //         Ok(0) => {
+    //             // EOF
+    //             trace!("stdin match Ok(0) bytes");
+    //             Ok((UnixEvent::ReadZeroBytes, &mut self.context))
+    //         }
+    //         Ok(n) => {
+    //             // read n bytes
+    //             trace!("stdin match Ok({n}) bytes");
+    //             let buf = self.buf.get_mut_slice(n);
+    //             let res = UnixEvent::Stdin(index, buf);
+    //             Ok((res, &mut self.context))
+    //         }
+    //     }
+    // }
+
+    pub fn event_handler(&self, event: UnixEvent) -> UnixEventResponse {
+        trace!("event_handler()");
+        // let context = Rc::clone(&self.context);
+        // let mut context = context.deref().borrow_mut();
+        // let handler = Rc::clone(&self.event_handlers);
+        // let mut handler = handler.deref().borrow_mut();
+        // let handler = handler;
+        // let handler = self.event_handlers.clone().get_mut();
+        // let res = handler.handle(
+        //     context,
+        //     event,
+        // );
+
+        // res
+        todo!()
     }
 
-    fn match_pty_master_event(
-        &self,
-        index: usize,
-        fd: &OwnedFd,
-    ) -> UnixEvent {
-        let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
-        match res {
-            Err(e) => {
-                // error
-                trace!("pty match Err({:?})", e);
-                e.into()
-            }
-            Ok(0) => {
-                // EOF
-                trace!("pty match Ok(0) bytes");
-                UnixEvent::ReadZeroBytes
-            }
-            Ok(n) => {
-                // read n bytes
-                trace!("pty match Ok({n}) bytes");
-                let buf = self.buf.get_slice_len(n);
-                let res = UnixEvent::PtyMaster(index, buf);
-                res
-            }
-        }
-    }
-
-    fn match_pty_slave_event(
-        &self,
-        index: usize,
-        fd: &OwnedFd,
-    ) -> UnixEvent {
-        let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
-        match res {
-            Err(e) => {
-                // error
-                trace!("pty match Err({:?})", e);
-                e.into()
-            }
-            Ok(0) => {
-                // EOF
-                trace!("pty match Ok(0) bytes");
-                UnixEvent::ReadZeroBytes
-            }
-            Ok(n) => {
-                // read n bytes
-                trace!("pty match Ok({n}) bytes");
-                let buf = self.buf.get_slice_len(n);
-                let res = UnixEvent::PtySlave(index, buf);
-                res
-            }
-        }
-    }
-
-    fn match_stdin_event(&self, index: usize, fd: &StdinLock<'static>) -> UnixEvent {
-        let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_slice());
-        match res {
-            Err(e) => {
-                // error
-                trace!("stdin match Err({:?})", e);
-                e.into()
-            }
-            Ok(0) => {
-                // EOF
-                trace!("stdin match Ok(0) bytes");
-                UnixEvent::ReadZeroBytes
-            }
-            Ok(n) => {
-                // read n bytes
-                trace!("stdin match Ok({n}) bytes");
-                let buf = self.buf.get_slice_len(n);
-                let res = UnixEvent::Stdin(index, buf);
-                res
-            }
-        }
-    }
-
-    pub fn system_event(&self) -> UnixEvent {
+    pub fn event_system(&mut self) -> Result<(UnixEvent, &mut AppContext), UnixError>  {
         trace!("poll(&mut fds, {:?})", self.poller.poll_timeout);
         match self.poller.poll() {
             Err(e) => {
                 error!("poll calling error: {}", e);
-                return e.into();
+                return Err(e.into());
             }
             Ok(0) => {
                 // timeout
                 // trace!("poll timeout: Ok(0)");
-                return UnixEvent::PollTimeout;
+                return Ok((UnixEvent::PollTimeout, &mut self.context));
             }
             Ok(n) => {
                 // match n events
@@ -564,49 +591,95 @@ impl UnixApp {
             }
         };
 
-        // trace!("{:#?}", self.fds);
-
         // Извлекаем необходимую информацию из итератора
-        if let Some((fd, index)) = self.poller.revent_iter().next() {
-            match &*fd {
-                Fd::Signal { fd, .. } => {
-                    return self.match_signal_event(index, fd);
+        while let Some(fd) = self.poller.revent_next() {
+            let len = Self::read_event(fd, self.buf.get_mut_all_slice());
+
+            let len = match len {
+                Err(e)=> {
+                    error!("poll calling error: {}", e);
+                    return Err(e.into());
                 }
-                Fd::PtyMaster { fd, .. } => {
-                    return self.match_pty_master_event(index, fd);
+                Ok(len) => len,
+            };
+
+            let buf = self.buf.get_mut_slice(len);
+
+            let event =  match fd {
+                Fd::Signal { .. } => {
+                    trace!("try convert to struct siginfo");
+                    let res = Self::map_ref_to_siginfo(buf);
+
+                    let signal = Signal::try_from(res.ssi_signo as i32);
+                    if let Err(e) = signal {
+                        error!("Error converting received bytes to the Signal struct: {e}");
+                        return Err(e.into());
+                    }
+
+                    let signal = signal.unwrap();
+
+                    UnixEvent::Signal(signal, res)
                 }
-                Fd::PtySlave { fd, .. } => {
-                    return self.match_pty_slave_event(index, fd);
+                Fd::PtyMaster { .. } => {
+                    UnixEvent::PtyMaster(buf)
                 }
-                Fd::Stdin { fd, .. } => {
-                    return self.match_stdin_event(index, fd);
+                Fd::PtySlave { .. } => {
+                    UnixEvent::PtySlave(buf)
+                }
+                Fd::Stdin { .. } => {
+                    UnixEvent::Stdin(buf)
                 }
                 Fd::Stdout { .. } => {
-                    // return self.match_stdout_event(index, fd);
+                    todo!();
                 }
-            }
+            };
+
+            let res = (event, &mut self.context);
+            
+            return Ok(res);
         }
 
-        UnixEvent::PollEventNotHandle
+       Ok((UnixEvent::PollEventNotHandle, &mut self.context))
     }
 
-    pub fn send_to(&self, index: usize, buf: &Ref<[u8]>) {
+    // pub fn send_to(&self, index: usize, buf: &Ref<[u8]>) {
+    //     self.poller.fds.send_to(index, buf)
+    // }
+
+    // pub fn write_to_stdout(&self, buf: &Ref<[u8]>) {
+    //     self.poller.fds.write_to_stdout(buf);
+    // }
+
+    // pub fn write_to_stdin(&self, buf: &Ref<[u8]>) {
+    //     self.poller.fds.write_to_stdin(buf);
+    // }
+
+    // pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
+    //     self.poller.fds.write_to_pty_master(buf);
+    // }
+
+    // pub fn write_to_pty_slave(&self, buf: &Ref<[u8]>) {
+    //     self.poller.fds.write_to_pty_slave(buf);
+    // }
+
+
+    pub fn send_to(&mut self, index: usize, buf: &mut [u8]) {
         self.poller.fds.send_to(index, buf)
     }
 
-    pub fn write_to_stdout(&self, buf: &Ref<[u8]>) {
+    pub fn write_to_stdout(&mut self, buf: &mut [u8]) {
         self.poller.fds.write_to_stdout(buf);
     }
 
-    pub fn write_to_stdin(&self, buf: &Ref<[u8]>) {
+    pub fn write_to_stdin(&mut self, buf: &mut [u8]) {
         self.poller.fds.write_to_stdin(buf);
     }
 
-    pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
+    pub fn write_to_pty_master(&mut self, buf: &mut [u8]) {
         self.poller.fds.write_to_pty_master(buf);
     }
 
-    pub fn write_to_pty_slave(&self, buf: &Ref<[u8]>) {
+    pub fn write_to_pty_slave(&mut self, buf: &mut [u8]) {
         self.poller.fds.write_to_pty_slave(buf);
     }
 }

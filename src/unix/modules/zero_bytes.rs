@@ -3,12 +3,12 @@ use std::rc::Rc;
 
 use crate::common::{AppContext, Handler};
 use crate::unix::{UnixEvent, UnixEventResponse};
-use super::EventMiddlewareType;
+use super::EventMiddlewareNext;
 use log::trace;
 
 
 pub struct ZeroBytesMiddleware<'a> {
-    next: Option<Rc<RefCell<EventMiddlewareType<'a>>>>,
+    next: EventMiddlewareNext<'a> ,
 }
 
 impl<'a> ZeroBytesMiddleware<'a>  {

@@ -1,6 +1,6 @@
 use crate::common::{AppContext, Handler};
 use crate::unix::{UnixEvent, UnixEventResponse};
-use super::EventMiddlewareType;
+use super::EventMiddlewareNext;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -13,10 +13,10 @@ use log::{trace, error, debug, info};
 
 
 pub struct SignalfdMiddleware<'a> {
-    next: Option<Rc<RefCell<EventMiddlewareType<'a>>>>,
+    next: EventMiddlewareNext<'a> ,
 }
 
-impl <'a> SignalfdMiddleware<'a> {
+impl SignalfdMiddleware<'_> {
     pub fn new() -> Self {
         Self {
             next: None,
@@ -80,7 +80,7 @@ impl<'a> Handler<&'a mut AppContext, UnixEvent<'a>, UnixEventResponse<'a>> for S
 
         let mut res = UnixEventResponse::Unhandled;
 
-        if let UnixEvent::Signal(_index, sig, _sigino) = &value {
+        if let UnixEvent::Signal(sig, _sigino) = &value {
             trace!("signal {:#?}", sig);
             if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
                 context.shutdown.shutdown_starting(0, None);

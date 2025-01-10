@@ -5,10 +5,14 @@ use std::cell::Ref;
 
 #[derive(Debug)]
 pub enum UnixEvent<'a> {
-    Stdin(usize, Ref<'a, [u8]>),
-    PtyMaster(usize, Ref<'a, [u8]>),
-    PtySlave(usize, Ref<'a, [u8]>),
-    Signal(usize, Signal, Ref<'a, siginfo>),
+    Stdin(&'a mut [u8]),
+    PtyMaster(&'a mut [u8]),
+    PtySlave(&'a mut [u8]),
+    Signal(Signal, &'a mut siginfo),
+    // Stdin(usize, Ref<'a, [u8]>),
+    // PtyMaster(usize, Ref<'a, [u8]>),
+    // PtySlave(usize, Ref<'a, [u8]>),
+    // Signal(usize, Signal, Ref<'a, siginfo>),
         // struct signalfd_siginfo {
         //     uint32_t ssi_signo;    /* Signal number */
         //     int32_t  ssi_errno;    /* Error number (unused) */
@@ -35,8 +39,8 @@ pub enum UnixEvent<'a> {
         // };
     ReadZeroBytes,
     PollTimeout,
-    StdIoError(std::io::Error),
-    NixErrorno(nix::errno::Errno),
+    // StdIoError(std::io::Error),
+    // NixErrorno(nix::errno::Errno),
     PollEventNotHandle,
 }
 
@@ -46,17 +50,17 @@ impl std::fmt::Display for UnixEvent<'_> {
     }
 }
 
-impl From<std::io::Error> for UnixEvent<'_> {
-    fn from(e: std::io::Error) -> Self {
-        UnixEvent::StdIoError(e)
-    }
-}
+// impl From<std::io::Error> for UnixEvent<'_> {
+//     fn from(e: std::io::Error) -> Self {
+//         UnixEvent::StdIoError(e)
+//     }
+// }
 
-impl From<nix::errno::Errno> for UnixEvent<'_> {
-    fn from(e: nix::errno::Errno) -> Self {
-        UnixEvent::NixErrorno(e)
-    }
-}
+// impl From<nix::errno::Errno> for UnixEvent<'_> {
+//     fn from(e: nix::errno::Errno) -> Self {
+//         UnixEvent::NixErrorno(e)
+//     }
+// }
 
 // impl<'a> From<WaitStatus> for UnixEvent<'a> {
 //     fn from(e: WaitStatus) -> Self {
@@ -67,11 +71,16 @@ impl From<nix::errno::Errno> for UnixEvent<'_> {
 #[derive(Debug)]
 pub enum UnixEventResponse<'a> {
     Unhandled,
-    SendTo(usize, Ref<'a, [u8]>),
-    WriteToStdOut(Ref<'a, [u8]>),
-    WriteToStdIn(Ref<'a, [u8]>),
-    WriteToPtyMaster(Ref<'a, [u8]>),
-    WriteToPtySlave(Ref<'a, [u8]>),
+    // SendTo(usize, Ref<'a, [u8]>),
+    // WriteToStdOut(Ref<'a, [u8]>),
+    // WriteToStdIn(Ref<'a, [u8]>),
+    // WriteToPtyMaster(Ref<'a, [u8]>),
+    // WriteToPtySlave(Ref<'a, [u8]>),
+    SendTo(usize, &'a mut [u8]),
+    WriteToStdOut(&'a mut [u8]),
+    WriteToStdIn(&'a mut [u8]),
+    WriteToPtyMaster(&'a mut [u8]),
+    WriteToPtySlave(&'a mut [u8]),
 }
 
 impl std::fmt::Display for UnixEventResponse<'_> {

@@ -1,4 +1,5 @@
 use std::borrow::{Borrow, BorrowMut};
+use std::fmt::Display;
 use std::io::{Stdin, StdinLock, Stdout};
 // use std::ops::Deref;
 use std::os::fd::OwnedFd;
@@ -63,10 +64,24 @@ impl Fd {
     }
 }
 
+impl Display for Fd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fd::Signal { fd, events } => write!(f, "SignalFd({:?}, {:?})", fd, events),
+            Fd::Stdin { fd, events, .. } => write!(f, "Stdin({:?}, {:?})", fd, events),
+            Fd::Stdout { fd, events } => write!(f, "Stdout({:?}, {:?})", fd, events),
+            Fd::PtyMaster { fd, events, .. } => write!(f, "PtyMaster({:?}, {:?})", fd, events),
+            Fd::PtySlave { fd, events } => write!(f, "PtySlave({:?}, {:?})", fd, events),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Fds {
-    inner: Vec<RefCell<Fd>>,
-    pollfds: RefCell<Option<Vec<libc::pollfd>>>,
+    // inner: Vec<RefCell<Fd>>,
+    // pollfds: RefCell<Option<Vec<libc::pollfd>>>,
+    inner: Vec<Fd>,
+    pollfds: Option<Vec<libc::pollfd>>,
     signalfd_index: Option<usize>,
     stdin_index: Option<usize>,
     stdout_index: Option<usize>,
@@ -77,8 +92,10 @@ pub struct Fds {
 impl Fds {
     pub fn new() -> Self {
         Self {
+            // inner: vec![],
+            // pollfds: RefCell::new(None),
             inner: vec![],
-            pollfds: RefCell::new(None),
+            pollfds: None,
             signalfd_index: None,
             stdin_index: None,
             stdout_index: None,
@@ -105,60 +122,119 @@ impl Fds {
         self.len() == 0
     }
 
+    // fn get_pollfd_by_raw_id<'a>(
+    //     pollfds: &'a mut RefMut<Vec<libc::pollfd>>,
+    //     raw_fd: i32,
+    // ) -> Option<&'a mut libc::pollfd> {
+    //     let res = pollfds.deref_mut();
+    //     let res = res.iter_mut().find(|x| x.fd == raw_fd);
+
+    //     res
+    // }
+
     fn get_pollfd_by_raw_id<'a>(
-        pollfds: &'a mut RefMut<Vec<libc::pollfd>>,
+        pollfds: &'a mut [libc::pollfd],
         raw_fd: i32,
     ) -> Option<&'a mut libc::pollfd> {
-        let res = pollfds.deref_mut();
-        let res = res.iter_mut().find(|x| x.fd == raw_fd);
+        // let res = pollfds.deref_mut();
+        let res = pollfds.iter_mut().find(|x| x.fd == raw_fd);
 
         res
     }
-
     /// Возвращает ссылку на файловый дескриптор по индексу
-    pub fn get_fd_by_index(&self, index: usize) -> Option<&RefCell<Fd>> {
-        self.inner.get(index)
+    // pub fn get_fd_by_index(&self, index: usize) -> Option<&RefCell<Fd>> {
+    //     self.inner.get(index)
+    // }
+    pub fn get_fd_by_index(&mut self, index: usize) -> Option<(&mut Fd, &mut libc::pollfd)> {
+        {
+            self.as_pollfds();
+        }
+
+        let fd = self.inner.get_mut(index);
+
+        if let Some(fd) = fd {
+            let pollfds = self.pollfds.as_mut().unwrap();
+            let y = pollfds.iter_mut().filter(|y| y.fd == fd.as_raw_fd()).last();
+
+            let res = y.map(|y| (fd, y));
+
+            return res;
+        }
+
+        None
     }
 
-    pub fn get_fd_by_raw_fd(&self, raw_fd: i32) -> Option<&RefCell<Fd>> {
+    // pub fn get_fd_by_raw_fd(&self, raw_fd: i32) -> Option<&RefCell<Fd>> {
+    //     self.inner
+    //         .iter()
+    //         .filter(|f| (*f).borrow().as_raw_fd() == raw_fd)
+    //         .last()
+    // }
+
+    pub fn get_fd_by_raw_fd(&mut self, raw_fd: i32) -> Option<&Fd> {
         self.inner
             .iter()
-            .filter(|f| (*f).borrow().as_raw_fd() == raw_fd)
+            .filter(|f| (*f).as_raw_fd() == raw_fd)
             .last()
     }
 
     /// Метод возвращает массив pollfd, который используется в nix::poll::poll.
     /// Если pollfds не был создан, то он создается и возвращается.
     /// Если pollfds был создан, то возвращается ссылка на него.
-    pub fn as_pollfds(&self) -> RefMut<Vec<libc::pollfd>> {
-        let res = self.pollfds.borrow_mut().as_deref().is_none();
+    // pub fn as_pollfds(&self) -> RefMut<Vec<libc::pollfd>> {
+    //     let res = self.pollfds.borrow_mut().as_deref().is_none();
+
+    //     if res {
+    //         let fds: Vec<libc::pollfd> = self
+    //             .inner
+    //             .iter()
+    //             .map(|fd| libc::pollfd {
+    //                 fd: fd.borrow().as_raw_fd(),
+    //                 events: fd.borrow().events().bits(),
+    //                 revents: 0,
+    //             })
+    //             .collect();
+
+    //         self.pollfds.replace(Some(fds));
+    //     }
+
+    //     let res = RefMut::map(self.pollfds.borrow_mut(), |pollfds| {
+    //         pollfds.as_mut().unwrap()
+    //     });
+
+    //     res
+    // }
+
+    pub fn as_pollfds(&mut self) -> &mut [libc::pollfd] {
+        let res = self.pollfds.is_none();
 
         if res {
             let fds: Vec<libc::pollfd> = self
                 .inner
                 .iter()
                 .map(|fd| libc::pollfd {
-                    fd: fd.borrow().as_raw_fd(),
-                    events: fd.borrow().events().bits(),
+                    fd: fd.as_raw_fd(),
+                    events: fd.events().bits(),
                     revents: 0,
                 })
                 .collect();
 
-            self.pollfds.replace(Some(fds));
+            self.pollfds = Some(fds);
         }
 
-        let res = RefMut::map(self.pollfds.borrow_mut(), |pollfds| {
-            pollfds.as_mut().unwrap()
-        });
-
+        let res = self.pollfds.as_mut().unwrap();
+        
         res
     }
 
+    // fn _push_fd(&mut self, new_fd: Fd) {
+    //     self.inner.push(RefCell::new(new_fd));
+    //     self.pollfds = RefCell::new(None); // Обнуляем кэш, чтобы пересоздать его позже
+    // }
     fn _push_fd(&mut self, new_fd: Fd) {
-        self.inner.push(RefCell::new(new_fd));
-        self.pollfds = RefCell::new(None); // Обнуляем кэш, чтобы пересоздать его позже
+        self.inner.push(new_fd);
+        self.pollfds = None; // Обнуляем кэш, чтобы пересоздать его позже
     }
-
     /// Добавляет новый файловый дескриптор в список файловых дескрипторов.
     pub fn push_fd(&mut self, new_fd: Fd) {
         match new_fd {
@@ -211,8 +287,6 @@ impl Fds {
         self.stdin_index = Some(self.inner.len() - 1);
     }
 
-    /// Удаляет последний файловый дескриптор из списка файловых дескрипторов
-    /// Если список файловых дескрипторов пуст, то ничего не делает
     pub fn pop_fd(&mut self) {
         let res = self.inner.pop();
 
@@ -235,15 +309,39 @@ impl Fds {
                 }
             }
 
-            self.pollfds = RefCell::new(None);
+            self.pollfds = None;
         }
     }
 
-    pub fn send_to(&self, index: usize, buf: &Ref<[u8]>) {
-        if let Some(fd) = self.inner.get(index) {
-            let mut res = fd.borrow_mut();
-            let res = res.deref_mut();
-            let res = match res {
+    // pub fn send_to(&self, index: usize, buf: &Ref<[u8]>) {
+    //     if let Some(fd) = self.inner.get(index) {
+    //         let mut res = fd.borrow_mut();
+    //         let res = res.deref_mut();
+    //         let res = match res {
+    //             Fd::Signal { fd, .. } => {
+    //                 error!("attempt to send a message to signalfd. this is not possible because signalfd can only be read");
+    //                 write(fd, buf.borrow())
+    //             }
+    //             Fd::Stdin { fd, .. } => {
+    //                 error!("attempt to send a message to signalfd. this is not possible because signalfd can only be read");
+    //                 write(fd, buf.borrow())
+    //             }
+    //             Fd::Stdout { fd, .. } => write(fd, buf.borrow()),
+    //             Fd::PtyMaster { fd, .. } => write(fd, buf.borrow()),
+    //             Fd::PtySlave { fd, .. } => write(fd, buf.borrow()),
+    //         };
+
+    //         if let Err(e) = res {
+    //             error!("error while sending message to fd: {}", e);
+    //         }
+    //     }
+    // }
+
+    pub fn send_to(&mut self, index: usize, buf: &mut [u8]) {
+        if let Some(fd) = self.inner.get_mut(index) {
+            // let mut res = fd.borrow_mut();
+            // let res = fd.deref_mut();
+            let res = match fd {
                 Fd::Signal { fd, .. } => {
                     error!("attempt to send a message to signalfd. this is not possible because signalfd can only be read");
                     write(fd, buf.borrow())
@@ -263,35 +361,59 @@ impl Fds {
         }
     }
 
-    pub fn write_to_stdout(&self, buf: &Ref<[u8]>) {
+    // pub fn write_to_stdout(&self, buf: &Ref<[u8]>) {
+    //     if let Some(index) = self.stdout_index {
+    //         self.send_to(index, buf);
+    //     }
+    // }
+
+    pub fn write_to_stdout(&mut self, buf: &mut [u8]) {
         if let Some(index) = self.stdout_index {
             self.send_to(index, buf);
         }
     }
 
-    pub fn write_to_stdin(&self, buf: &Ref<[u8]>) {
+    // pub fn write_to_stdin(&self, buf: &Ref<[u8]>) {
+    //     if let Some(index) = self.stdin_index {
+    //         self.send_to(index, buf);
+    //     }
+    // }
+    pub fn write_to_stdin(&mut self, buf: &mut [u8]) {
         if let Some(index) = self.stdin_index {
             self.send_to(index, buf);
         }
     }
 
-    pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
+
+    // pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
+    //     if let Some(index) = self.pty_master_index {
+    //         self.send_to(index, buf);
+    //     }
+    // }
+    pub fn write_to_pty_master(&mut self, buf: &mut [u8]) {
         if let Some(index) = self.pty_master_index {
             self.send_to(index, buf);
         }
     }
 
-    pub fn write_to_pty_slave(&self, buf: &Ref<[u8]>) {
+    // pub fn write_to_pty_slave(&self, buf: &Ref<[u8]>) {
+    //     if let Some(index) = self.pty_slave_index {
+    //         self.send_to(index, buf);
+    //     }
+    // }
+    pub fn write_to_pty_slave(&mut self, buf: &mut [u8]) {
         if let Some(index) = self.pty_slave_index {
             self.send_to(index, buf);
         }
     }
+
 }
 
 #[derive(Debug)]
 pub struct Poller {
     pub fds: Fds,
     pub poll_timeout: PollTimeout,
+    index: usize,
 }
 
 /// Итератор по событиям, возвращаемым poll
@@ -309,28 +431,47 @@ impl<'a> Iterator for PollReventIterator<'a> {
     type Item = (Ref<'a, Fd>, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let len = self.fds.len();
-        while self.index < len {
-            let index = self.index;
-            self.index += 1;
+        
+        // let len = self.fds.len();
+        // while self.index < len {
+        //     let index = self.index;
+        //     self.index += 1;
 
-            let fd = self.fds.get_fd_by_index(index).unwrap();
-            let fd = fd.borrow();
-            let raw_fd = fd.as_raw_fd();
-            let mut res = self.fds.as_pollfds();
-            let res = Fds::get_pollfd_by_raw_id(&mut res, raw_fd);
+        //     let fd = self.fds.get_fd_by_index(index).unwrap();
+        //     let fd = fd.borrow();
+        //     let raw_fd = fd.as_raw_fd();
+        //     let mut res = self.fds.as_pollfds();
+        //     let res = Fds::get_pollfd_by_raw_id(&mut res, raw_fd);
 
-            if let Some(res) = res {
-                if res.revents != 0 {
-                    res.revents = 0;
-                    return Some((fd, index));
-                }
-            }
-        }
+        //     if let Some(res) = res {
+        //         if res.revents != 0 {
+        //             res.revents = 0;
+        //             return Some((fd, index));
+        //         }
+        //     }
+        // }
 
         None
     }
 }
+
+
+// #[derive(Debug)]
+// pub struct PollRevent2Iterator<'a> {
+//     fds: &'a Fds,
+//     index: usize,
+// }
+
+// impl<'a> IntoIterator for PollRevent2Iterator<'a> {
+//     type Item = &'a mut Fd;
+
+//     type IntoIter = std::vec::IntoIter<Self::Item>;
+
+//     fn into_iter(self) -> Self::IntoIter {
+//         self.0.into_iter()
+//     }
+// }
+
 
 /// Итератор по файловым дескрипторам
 #[derive(Debug)]
@@ -343,12 +484,12 @@ impl<'b> Iterator for FdsIterator<'b> {
     type Item = Ref<'b, Fd>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.poller.fds.len() {
-            let res = self.poller.fds.get_fd_by_index(self.index).unwrap();
-            let res = res.borrow();
-            self.index += 1;
-            return Some(res);
-        }
+        // if self.index < self.poller.fds.len() {
+        //     let res = self.poller.fds.get_fd_by_index(self.index).unwrap();
+        //     let res = res.borrow();
+        //     self.index += 1;
+        //     return Some(res);
+        // }
 
         None
     }
@@ -359,10 +500,22 @@ impl Poller {
         Self {
             fds: Fds::new(),
             poll_timeout,
+            index: 0,
         }
     }
 
-    pub fn poll(&self) -> nix::Result<libc::c_int> {
+    // pub fn poll(&self) -> nix::Result<libc::c_int> {
+    //     let res = unsafe {
+    //         libc::poll(
+    //             self.fds.as_pollfds().as_mut_ptr(),
+    //             self.fds.len() as libc::nfds_t,
+    //             i32::from(self.poll_timeout),
+    //         )
+    //     };
+
+    //     nix::errno::Errno::result(res)
+    // }
+    pub fn poll(&mut self) -> nix::Result<libc::c_int> {
         let res = unsafe {
             libc::poll(
                 self.fds.as_pollfds().as_mut_ptr(),
@@ -379,6 +532,27 @@ impl Poller {
             fds: &self.fds,
             index: 0,
         }
+    }
+
+    // pub fn reset_index(&mut self) {
+    //     self.index = 0;
+    // }
+
+    pub fn revent_next(&mut self) -> Option<&mut Fd> {
+        if self.index < self.fds.len() {
+            self.index += 1;
+
+            let (fd, pollfd) = self.fds.get_fd_by_index(self.index).unwrap();
+
+            if pollfd.revents != 0 {
+                pollfd.revents = 0;
+                return Some(fd);
+            }
+        }
+
+        self.index = 0;
+
+        None
     }
 
     pub fn iter(&self) -> FdsIterator {

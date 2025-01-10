@@ -3,15 +3,15 @@ use std::rc::Rc;
 
 use crate::common::{AppContext, Handler};
 use crate::unix::{UnixEvent, UnixEventResponse};
-use super::EventMiddlewareType;
+use super::EventMiddlewareNext;
 use log::trace;
 
 
 pub struct PollTimeoutMiddleware<'a> {
-    next: Option<Rc<RefCell<EventMiddlewareType<'a>>>>,
+    next: EventMiddlewareNext<'a>,
 }
 
-impl<'a> PollTimeoutMiddleware<'a>  {
+impl PollTimeoutMiddleware<'_>  {
     pub fn new() -> Self {
         Self {
             next: None,
