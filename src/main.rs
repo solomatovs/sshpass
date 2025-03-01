@@ -1,15 +1,15 @@
+#![feature(allocator_api)]
+
 use clap::{Arg, ArgGroup, Command};
-use common::Handler;
-use log::trace;
+
+use log::{info, trace};
 use std::str::FromStr;
-use unix::LoggingMiddleware;
 
 mod app;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::UnixApp;
-mod common;
+use unix::{DefaultPollMiddleware, PollHandler, UnixContext};
 
 fn cli() -> Command {
     Command::new("sshpass")
@@ -105,6 +105,12 @@ fn cli() -> Command {
                 .long("otp-prompt")
                 .help("Which string should sshpass search for the one time password prompt"),
         )
+        .arg(
+            Arg::new("default_buffer_size")
+                .short('B')
+                .long("default-buffer-size")
+                .help("default buffer size for all file descriptors"),
+        )
         .group(
             ArgGroup::new("password-conflict")
                 .args(["password"])
@@ -162,97 +168,119 @@ fn main() {
     trace!("mach arguments {:#?}", args);
 
     #[cfg(target_os = "linux")]
-    let status = {
-        trace!("app ok, create unix app");
-        let mut app = UnixApp::new(args).unwrap();
-        let mut handle = LoggingMiddleware::new();
+    let (stop_code, stop_message) = {
+        let timeout: i32 = *args.get_one::<i32>("poll_timeout").unwrap_or(&2000);
 
-        while !app.context.shutdown.is_stop() {
-            let event = app.event_system();
-            // let context = &mut app.context;
-            // handle.handle(&mut app.context, event);
-            // app.event_handler(event);
+        let default_buffer_size = *args
+            .get_one::<usize>("default_buffer_size")
+            .unwrap_or(&4096);
+
+        // app.bootstrap_base(default_buffer_size);
+
+        // let program = args.get_one::<String>("program").unwrap();
+        // let program_args = args.get_many::<String>("program_args");
+        // app.bootstrap_child(program, program_args, default_buffer_size);
+
+        // let mut poll_event_handler = EventMiddleware::new();
+        // let poll_in = Box::new(PollInHandler::new());
+        // let poll_out = Box::new(PollOutHandler::new());
+        // let poll_err = Box::new(PollErrHandler::new());
+        // let poll_hup = Box::new(PollHupHandler::new());
+        // let poll_nval = Box::new(PollNvalHandler::new());
+        // poll_event_handler.reg_pollin(poll_in);
+        // poll_event_handler.reg_pollout(poll_out);
+        // poll_event_handler.reg_pollerr(poll_err);
+        // poll_event_handler.reg_pollhup(poll_hup);
+        // poll_event_handler.reg_pollnval(poll_nval);
+
+        // let mut poll_error_handler = PollErrorMiddleware::new();
+
+        let mut app = DefaultPollMiddleware::new(UnixContext::new());
+
+        while !app.is_stoped() {
+            let res = app.poll(timeout);
+            app.handle(res);
         }
 
-        let exit_code = app.context.shutdown.stop_code();
-        trace!("app exit with code {}", exit_code);
-        exit_code
+        (app.stop_code(), app.stop_message())
     };
 
-    std::process::exit(status);
+    info!("app exit");
+    info!("code {stop_code}");
+    info!("message {stop_message}");
+
+    std::process::exit(stop_code);
 }
 
+// for res in rx.try_iter() {
+//     match res {
+//         UnixEventResponse::SendTo(index, buf) => {
+//             app.send_to(index, &buf);
+//         }
+//         UnixEventResponse::WriteToStdOut(buf) => {
+//             app.write_to_stdout(&buf);
+//         }
+//         UnixEventResponse::WriteToStdIn(buf) => {
+//             app.write_to_stdin(&buf);
+//         }
+//         UnixEventResponse::WriteToPtyMaster(buf) => {
+//             app.write_to_pty_master(&buf);
+//         }
+//         UnixEventResponse::WriteToPtySlave(buf) => {
+//             app.write_to_pty_slave(&buf);
+//         }
+//         UnixEventResponse::Unhandled => {
+//             // stop.shutdown_starting(4, Some("unhandled event".to_owned()));
+//         }
+//     }
+// }
 
-            // for res in rx.try_iter() {
-            //     match res {
-            //         UnixEventResponse::SendTo(index, buf) => {
-            //             app.send_to(index, &buf);
-            //         }
-            //         UnixEventResponse::WriteToStdOut(buf) => {
-            //             app.write_to_stdout(&buf);
-            //         }
-            //         UnixEventResponse::WriteToStdIn(buf) => {
-            //             app.write_to_stdin(&buf);
-            //         }
-            //         UnixEventResponse::WriteToPtyMaster(buf) => {
-            //             app.write_to_pty_master(&buf);
-            //         }
-            //         UnixEventResponse::WriteToPtySlave(buf) => {
-            //             app.write_to_pty_slave(&buf);
-            //         }
-            //         UnixEventResponse::Unhandled => {
-            //             // stop.shutdown_starting(4, Some("unhandled event".to_owned()));
-            //         }
-            //     }
-            // }
+// match app.system_event() {
+//     Ok(res) => match res {
+//         UnixEvent::PollTimeout => {
+//             // проверяю остановлено ли приложение
+//             let shut = &app.context.borrow().shutdown;
+//             if shut.is_stoped() {
+//                 // break shut.stop_code();
+//             }
+//         }
+//         UnixEvent::PtyMaster(_index, buf) => {
+//             trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
+//             tx.send(UnixEventResponse::WriteToStdOut(buf)).unwrap();
+//         }
+//         UnixEvent::PtySlave(_index, buf) => {
+//             trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
+//         }
+//         UnixEvent::Stdin(_index, buf) => {
+//             trace!("stdin utf8: {}", String::from_utf8_lossy(&buf));
+//             tx.send(UnixEventResponse::WriteToPtyMaster(buf)).unwrap();
+//         }
+//         UnixEvent::Signal(_index, sig, _sigino) => {
+//             trace!("signal {:#?}", sig);
+//             if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
+//                 // stop.shutdown_starting(0, None);
+//             }
 
-            // match app.system_event() {
-            //     Ok(res) => match res {
-            //         UnixEvent::PollTimeout => {
-            //             // проверяю остановлено ли приложение
-            //             let shut = &app.context.borrow().shutdown;
-            //             if shut.is_stoped() {
-            //                 // break shut.stop_code();
-            //             }
-            //         }
-            //         UnixEvent::PtyMaster(_index, buf) => {
-            //             trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
-            //             tx.send(UnixEventResponse::WriteToStdOut(buf)).unwrap();
-            //         }
-            //         UnixEvent::PtySlave(_index, buf) => {
-            //             trace!("pty utf8: {}", String::from_utf8_lossy(&buf));
-            //         }
-            //         UnixEvent::Stdin(_index, buf) => {
-            //             trace!("stdin utf8: {}", String::from_utf8_lossy(&buf));
-            //             tx.send(UnixEventResponse::WriteToPtyMaster(buf)).unwrap();
-            //         }
-            //         UnixEvent::Signal(_index, sig, _sigino) => {
-            //             trace!("signal {:#?}", sig);
-            //             if matches!(sig, Signal::SIGINT | Signal::SIGTERM) {
-            //                 // stop.shutdown_starting(0, None);
-            //             }
-
-            //             if matches!(sig, Signal::SIGCHLD) {
-            //                 let pid = _sigino.ssi_pid as nix::libc::pid_t;
-            //                 // let res = app.waitpid(pid);
-            //                 // trace!("waitpid({}) = {:#?}", pid, res);
-            //             }
-            //         }
-            //         UnixEvent::ReadZeroBytes => {
-            //             trace!("read zero bytes");
-            //         }
-            //     },
-            //     Err(UnixError::StdIoError(ref e)) => {
-            //         // stop.shutdown_starting(1, Some(format!("IO Error: {}", e)));
-            //     }
-            //     Err(UnixError::NixErrorno(ref e)) => {
-            //         // stop.shutdown_starting(2, Some(format!("Nix Error: {}", e)));
-            //     }
-            //     Err(UnixError::PollEventNotHandle) => {
-            //         // stop.shutdown_starting(3, Some("the poll event not handle".to_owned()));
-            //     }
-            // };
-
+//             if matches!(sig, Signal::SIGCHLD) {
+//                 let pid = _sigino.ssi_pid as nix::libc::pid_t;
+//                 // let res = app.waitpid(pid);
+//                 // trace!("waitpid({}) = {:#?}", pid, res);
+//             }
+//         }
+//         UnixEvent::ReadZeroBytes => {
+//             trace!("read zero bytes");
+//         }
+//     },
+//     Err(UnixError::StdIoError(ref e)) => {
+//         // stop.shutdown_starting(1, Some(format!("IO Error: {}", e)));
+//     }
+//     Err(UnixError::NixErrorno(ref e)) => {
+//         // stop.shutdown_starting(2, Some(format!("Nix Error: {}", e)));
+//     }
+//     Err(UnixError::PollEventNotHandle) => {
+//         // stop.shutdown_starting(3, Some("the poll event not handle".to_owned()));
+//     }
+// };
 
 fn _strip_nl(s: &mut String) -> String {
     if s.ends_with('\n') {

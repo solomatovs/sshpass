@@ -1,215 +1,547 @@
-use std::borrow::{Borrow, BorrowMut};
-use std::boxed::Box;
-use std::cell::{Ref, RefCell};
-use std::io::{Stdin, StdinLock};
+use std::alloc::{self, AllocError, Layout};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::os::fd::{OwnedFd, RawFd};
+// use std::borrow::{Borrow, BorrowMut};
+// use std::boxed::Box;
+// use std::cell::{Ref, RefCell};
+// use std::io::{Read, Stdin, StdinLock};
+// use std::ops::{Deref, DerefMut};
+use nix::pty::openpty;
+use nix::unistd::Pid;
+use nix::unistd::{fork, ForkResult};
+use std::ffi::OsStr;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
-use std::rc::Rc;
+
+use nix::libc;
+use nix::poll::PollFlags;
+use nix::sys::signalfd::{siginfo, SfdFlags, SignalFd};
+
+use nix::sys::termios::{self, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios};
+
+use log::trace;
+
+use nix::sys::signal::{SigSet, Signal};
+
 use std::time::Instant;
 
-use flexi_logger::LoggerHandle;
-use nix::errno::Errno::EAGAIN;
-use nix::pty::{openpty, OpenptyResult};
-use nix::sys::signal::{SigSet, Signal};
-use nix::sys::signalfd::{siginfo, SfdFlags, SignalFd};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::Pid;
-use nix::unistd::{fork, ForkResult};
-use nix::{
-    poll::{PollFlags, PollTimeout},
-    unistd::read,
-};
+use crate::unix::PollHandler;
 
-use termios::Termios;
-use termios::{
-    tcsetattr, BRKINT, CS8, CSIZE, ECHO, ECHONL, ICANON, ICRNL, IEXTEN, IGNBRK, IGNCR, INLCR, ISIG,
-    ISTRIP, IXON, OPOST, PARENB, PARMRK, TCSANOW, VMIN, VTIME,
-};
-
-use clap::parser::ValuesRef;
-use clap::ArgMatches;
-use log::{error, trace};
-
-use crate::common::{AppContext, Handler};
-use crate::unix::fds::{Fd, Poller};
-use crate::unix::modules::{
-    LoggingMiddleware,
-    // SignalfdMiddleware,
-    // ZeroBytesMiddleware,
-    // PtyMiddleware,
-    // PollTimeoutMiddleware,
-    // StdMiddleware,
-};
-use crate::unix::unix_error::UnixError;
-use crate::unix::unix_event::UnixEvent;
-use crate::unix::unix_event::UnixEventResponse;
-
-use super::EventMiddlewareType;
-
-// Флаг          Значение
-// ISIG          Разрешить посылку сигналов
-// ICANON        Канонический ввод (обработка забоя и стирания строки)
-// XCASE         Каноническое представление верхнего/нижнего регистров
-// ECHO          Разрешить эхо
-// ECHOE         Эхо на символ забоя - BS-SP-BS
-// ECHOK         Выдавать NL после символа стирания строки
-// ECHONL        Выдавать эхо на NL
-// NOFLSH        Запретить сброс буферов после сигналов прерывания и
-//               завершения
-// TOSTOP        Посылать SIGTTOU фоновым процессам, которые пытаются
-//               выводить на терминал
-// ECHOCTL       Выдавать эхо на CTRL-символы как .r, ASCII DEL как
-//               ?
-// ECHOPRT       Эхо на символ забоя как стертый символ
-// ECHOKE        При стирании строки, очищать ранее введенную строку
-//               символами BS-SP-BS
-// FLUSHO        Сбрасывание буфера вывода (состояние)
-// PENDIN        Повторять несчитанный ввод при следующем чтении или
-//               введенном символе
-// IEXTEN        Разрешить расширенные (определенные реализацией)
-//               функции
-fn set_keypress_mode(termios: &mut Termios) {
-    termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    termios.c_oflag &= !OPOST;
-    termios.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    termios.c_cflag &= !(CSIZE | PARENB);
-    termios.c_cflag |= CS8;
-    termios.c_cc[VMIN] = 0;
-    termios.c_cc[VTIME] = 0;
-}
-
-fn set_termios(stdin_fild: i32, termios: &Termios) -> std::io::Result<()> {
-    tcsetattr(stdin_fild, TCSANOW, termios)?;
-    Ok(())
-}
-
-fn get_termios(stdin_fild: i32) -> std::io::Result<Termios> {
-    Termios::from_fd(stdin_fild)
-}
-
-fn _get_termsize(stdin_fild: i32) -> std::io::Result<Box<nix::libc::winsize>> {
-    let mut size = Box::new(nix::libc::winsize {
-        ws_row: 25,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    });
-    let ret = unsafe { nix::libc::ioctl(stdin_fild, nix::libc::TIOCGWINSZ, &mut *size) };
-
-    match ret {
-        0 => Ok(size),
-        _ => Err(std::io::Error::last_os_error()),
-    }
-}
-
-// pub fn _set_termsize(fd: i32, mut size: Box<nix::libc::winsize>) -> std::io::Result<()> {
-//     let ret = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &mut *size) };
-
-//     match ret {
-//         0 => Ok(()),
-//         _ => Err(std::io::Error::last_os_error()),
-//     }
-// }
-pub fn _set_termsize(fd: i32, mut size: nix::libc::winsize) -> std::io::Result<()> {
-    let ret = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &mut size) };
-
-    match ret {
-        0 => Ok(()),
-        _ => Err(std::io::Error::last_os_error()),
-    }
-}
+use std::fmt;
 
 #[derive(Debug)]
-pub struct Buffer {
-    // buf: RefCell<Vec<u8>>,
-    buf: Vec<u8>,
+pub enum UnixError {
+    AllocationError(String),
+    OpenPTYError(String),
+    CommandError(String),
+    SignalFdError(String),
+    StdInRegisterError(String),
 }
 
-impl Buffer {
-    pub fn new(size: usize) -> Self {
+impl fmt::Display for UnixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NixError")
+    }
+}
+
+impl std::error::Error for UnixError {}
+
+#[derive(Debug)]
+pub struct AppShutdown {
+    is_stoped: bool,
+    is_stop: bool,
+    stop_time: Option<Instant>,
+    stop_code: Option<i32>,
+    stop_message: Option<String>,
+}
+
+impl AppShutdown {
+    pub fn new() -> Self {
         Self {
-            // buf: RefCell::new(vec![0; size]),
-            buf: vec![0; size],
+            is_stoped: false,
+            is_stop: false,
+            stop_time: None,
+            stop_code: None,
+            stop_message: None,
         }
     }
 
-    // pub fn get_slice_len(&self, len: usize) -> std::cell::Ref<[u8]> {
-    //     std::cell::Ref::map(self.buf.borrow(), |vec| &vec[..len])
-    // }
-
-    // /// Получает изменяемый срез
-    // pub fn get_mut_slice(&self) -> std::cell::RefMut<[u8]> {
-    //     std::cell::RefMut::map(self.buf.borrow_mut(), |vec| vec.as_mut_slice())
-    // }
-
-    pub fn get_slice_len(&self, len: usize) -> &[u8] {
-        &self.buf[..len]
+    pub fn is_stop(&self) -> bool {
+        self.is_stop
     }
 
-    /// Получает изменяемый срез
-    pub fn get_mut_slice(&mut self, len: usize) -> &mut [u8] {
-        // std::cell::RefMut::map(self.buf.borrow_mut(), |vec| vec.as_mut_slice())
-        &mut self.buf[..len]
+    pub fn is_stoped(&self) -> bool {
+        self.is_stoped
+    }
+
+    pub fn shutdown_starting(&mut self, stop_code: i32, error: Option<String>) {
+        self.stop_time = Some(Instant::now());
+        self.is_stop = true;
+        self.is_stoped = false;
+        self.stop_code = Some(stop_code);
+        self.stop_message = error;
+    }
+
+    pub fn shutdown_complited(&mut self) {
+        self.is_stop = false;
+        self.is_stoped = true;
+    }
+
+    pub fn shutdown_cancel(&mut self) {
+        self.is_stop = false;
+        self.is_stoped = false;
+        self.stop_time = None;
+        self.stop_code = None;
+        self.stop_message = None;
+    }
+
+    pub fn stop_code(&self) -> i32 {
+        self.stop_code.unwrap_or(255)
+    }
+
+    pub fn stop_message(&self) -> String {
+        self.stop_message.as_deref().unwrap_or("no message").into()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Buffer {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl Buffer {
+    pub fn try_new(size: usize) -> Result<Self, AllocError> {
+        // Обработка случая с нулевой емкостью
+        if size == 0 {
+            return Ok(Self {
+                buf: Vec::new(),
+                len: 0,
+            });
+        }
+
+        // Проверка на переполнение при выделении памяти
+        let layout = match Layout::array::<u8>(size) {
+            Ok(layout) => layout,
+            Err(_) => return Err(AllocError),
+        };
+
+        unsafe {
+            // Попытка выделить память
+            let ptr = alloc::alloc(layout);
+
+            // Проверка на ошибку аллокации
+            if ptr.is_null() {
+                return Err(AllocError);
+            }
+
+            // Преобразование в Vec
+            let buf = Vec::from_raw_parts(ptr, 0, size);
+            Ok(Self { buf, len: 0 })
+        }
+    }
+
+    pub fn set_len(&mut self, len: usize) {
+        self.len = len.min(self.buf.capacity());
+    }
+
+    pub fn get_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    pub fn get_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[..self.len]
     }
 
     pub fn get_mut_all_slice(&mut self) -> &mut [u8] {
-        // std::cell::RefMut::map(self.buf.borrow_mut(), |vec| vec.as_mut_slice())
         &mut self.buf
     }
 }
 
-// #[derive(Debug)]
-pub struct UnixApp {
-    poller: Poller,
-    buf: Buffer,
-    pub context: AppContext,
+impl Deref for Buffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.buf[..self.len]
+    }
 }
 
-impl UnixApp {
-    pub fn new(args: ArgMatches) -> Result<Self, UnixError> {
-        // Создаем контейнер для дескрипторов, которые будут опрашиваться через poll
-        let mut res = Self {
-            poller: Poller::new(PollTimeout::from(200_u16)),
-            buf: Buffer::new(4096),
-            context: AppContext::default(),
-        };
+impl DerefMut for Buffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buf[..self.len]
+    }
+}
 
-        res.reg_signals()?;
+#[derive(Debug, Clone)]
+pub struct BufferPool {
+    buffers: Vec<Buffer>,
+    max_size: usize,
+    buffer_size: usize,
+}
 
-        let program = args.get_one::<String>("program").unwrap();
-        let program_args = args.get_many::<String>("program_args");
-        res.reg_pty_child(program, program_args)?;
-
-        res.reg_non_canonical_stdin()?;
-
-        res.reg_stdout()?;
-
-        // res.reg_event_handlers()?;
-
-        Ok(res)
+impl BufferPool {
+    pub fn try_new(max_size: usize, buffer_size: usize) -> Result<Self, AllocError> {
+        Ok(Self {
+            buffers: Vec::new(), // Пустой вектор не вызовет ошибку аллокации
+            max_size,
+            buffer_size,
+        })
     }
 
-    pub fn reg_event_handlers(&mut self) -> Result<(), UnixError> {
-        // Регистрируем обработчики событий
-        // let context = Rc::clone(&self.context);
-        // let res = SignalfdMiddleware::new(context.take());
-        // let res = *self.event_handlers.next(Box::new());
-        // res;
+    pub fn try_add_buffer(&mut self, buffer: Buffer) -> Result<(), AllocError> {
+        if self.buffers.len() < self.max_size {
+            // try_reserve для одного элемента
+            self.buffers.try_reserve(1).map_err(|_| AllocError)?;
+            self.buffers.push(buffer);
+        }
+        Ok(())
+    }
 
-        todo!();
+    // Этот метод не требует изменений, так как не аллоцирует память
+    pub fn get_next_buffer(&mut self) -> Option<Buffer> {
+        self.buffers.pop()
+    }
+
+    pub fn try_allocate_buffer(&mut self) -> Result<Option<Buffer>, AllocError> {
+        if self.buffers.len() < self.max_size {
+            Buffer::try_new(self.buffer_size).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl IntoIterator for BufferPool {
+    type Item = Buffer;
+    type IntoIter = std::vec::IntoIter<Buffer>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.buffers.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a BufferPool {
+    type Item = &'a Buffer;
+    type IntoIter = std::slice::Iter<'a, Buffer>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.buffers.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut BufferPool {
+    type Item = &'a mut Buffer;
+    type IntoIter = std::slice::IterMut<'a, Buffer>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.buffers.iter_mut()
+    }
+}
+
+#[derive(Debug)]
+pub enum FileType {
+    Stdin {
+        fd: std::io::Stdin,
+        buf: Buffer,
+        termios: Termios,
+    },
+    Stdout {
+        fd: std::io::Stdout,
+        buf: Buffer,
+    },
+    Stderr {
+        fd: std::io::Stderr,
+        buf: Buffer,
+    },
+    SignalFd {
+        fd: SignalFd,
+        buf: Buffer,
+    },
+    PtyMaster {
+        master: OwnedFd,
+        buf: Buffer,
+        slave: OwnedFd,
+        child: Pid,
+    },
+}
+
+impl std::fmt::Display for FileType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileType::Stdin { fd, buf, .. } => {
+                write!(f, "Stdin(fd: {}, buf_size: {})", fd.as_raw_fd(), buf.len)
+            }
+            FileType::Stdout { fd, buf } => {
+                write!(f, "Stdout(fd: {}, buf_size: {})", fd.as_raw_fd(), buf.len)
+            }
+            FileType::Stderr { fd, buf } => {
+                write!(f, "Stderr(fd: {}, buf_size: {})", fd.as_raw_fd(), buf.len)
+            }
+            FileType::SignalFd { fd, buf } => {
+                write!(f, "SignalFd(fd: {}, buf_size: {})", fd.as_raw_fd(), buf.len)
+            }
+            FileType::PtyMaster {
+                master, buf, child, ..
+            } => {
+                write!(
+                    f,
+                    "PtyMaster(fd: {}, buf_size: {}, child_pid: {})",
+                    master.as_raw_fd(),
+                    buf.len,
+                    child
+                )
+            }
+        }
+    }
+}
+
+impl FileType {
+    pub fn as_fd(&self) -> BorrowedFd {
+        match self {
+            FileType::Stdin { fd, .. } => fd.as_fd(),
+            FileType::Stdout { fd, .. } => fd.as_fd(),
+            FileType::Stderr { fd, .. } => fd.as_fd(),
+            FileType::SignalFd { fd, .. } => fd.as_fd(),
+            FileType::PtyMaster { master, .. } => master.as_fd(),
+        }
+    }
+
+    pub fn as_raw_fd(&self) -> i32 {
+        match self {
+            FileType::Stdin { fd, .. } => fd.as_raw_fd(),
+            FileType::Stdout { fd, .. } => fd.as_raw_fd(),
+            FileType::Stderr { fd, .. } => fd.as_raw_fd(),
+            FileType::SignalFd { fd, .. } => fd.as_raw_fd(),
+            FileType::PtyMaster { master, .. } => master.as_raw_fd(),
+        }
+    }
+
+    pub fn make_events(&self) -> PollFlags {
+        match self {
+            FileType::Stdin { .. } => {
+                PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL
+            }
+            FileType::Stdout { .. } => {
+                PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL
+            }
+            FileType::Stderr { .. } => {
+                PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL
+            }
+            FileType::SignalFd { .. } => {
+                PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL
+            }
+            FileType::PtyMaster { .. } => {
+                PollFlags::POLLIN
+                    | PollFlags::POLLOUT
+                    | PollFlags::POLLERR
+                    | PollFlags::POLLHUP
+                    | PollFlags::POLLNVAL
+            }
+        }
+    }
+
+    pub fn get_mut_buf(&mut self) -> &mut Buffer {
+        match self {
+            FileType::Stdin { buf, .. } => buf,
+            FileType::Stdout { buf, .. } => buf,
+            FileType::Stderr { buf, .. } => buf,
+            FileType::SignalFd { buf, .. } => buf,
+            FileType::PtyMaster { buf, .. } => buf,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum PollEvent {
+    Timeout,
+    Event(RawFd),
+}
+
+pub enum UnixEvent {
+    Stdin(usize),
+    Stdout(usize),
+    Stderr(usize),
+    PtyMaster(usize),
+    Signal(usize),
+    NotHandle,
+}
+
+// #[derive(Debug)]
+pub struct UnixContext {
+    fds: HashMap<RawFd, FileType>,
+    pub pollfds: Vec<libc::pollfd>,
+    pub shutdown: AppShutdown,
+}
+
+impl UnixContext {
+    pub fn new() -> Self {
+        // Создаем контейнер для дескрипторов, который будет опрашиваться через poll
+        Self {
+            fds: HashMap::new(), // Пустой HashMap не вызовет ошибку аллокации
+            pollfds: Vec::new(),
+            shutdown: AppShutdown::new(),
+        }
+    }
+
+    // pub fn reg_handler(&mut self, handler: impl PollHandler<UnixContext> + 'static) {
+    //     self.handler = Some(Box::new(handler));
+    // }
+
+    pub fn bootstrap_base(&mut self, buffer_size: usize) {
+        self.reg_stdin_non_canonical_mode_if_not_exists(buffer_size)
+            .and_then(|_| self.reg_stdout_if_not_exists(buffer_size))
+            .and_then(|_| self.reg_stderr_if_not_exists(buffer_size))
+            .and_then(|_| self.reg_signals_if_not_exists())
+            .map_err(|e| {
+                self.shutdown
+                    .shutdown_starting(-1, Some(format!("error bootstraping app: {:#?}", e)));
+            });
+    }
+
+    pub fn bootstrap_child<S, I>(&mut self, program: S, args: Option<I>, buffer_length: usize)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.reg_pty_child(program, args, buffer_length)
+            .map_err(|e| {
+                self.shutdown
+                    .shutdown_starting(-1, Some(format!("error bootstraping app: {:#?}", e)));
+            });
+    }
+
+    pub fn reg_signals_if_not_exists(&mut self) -> Result<(), UnixError> {
+        let mut mask = SigSet::empty();
+
+        // добавляю в обработчик все сигналы
+        for signal in Signal::iterator() {
+            mask.add(signal);
+        }
+
+        let mut new_mask = SigSet::thread_get_mask()
+            .map_err(|e| UnixError::SignalFdError(format!("failed get thread mask: {:#?}", e)))?;
+        for s in mask.into_iter() {
+            new_mask.add(s);
+        }
+
+        new_mask
+            .thread_block()
+            .map_err(|e| UnixError::SignalFdError(format!("failed set thread mask: {:#?}", e)))?;
+
+        let fd = SignalFd::with_flags(&new_mask, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
+            .map_err(|e| {
+                UnixError::SignalFdError(format!("signalfd create failed error: {:#?}", e))
+            })?;
+
+        let size = std::mem::size_of::<siginfo>();
+        let buf = Buffer::try_new(size).map_err(|_e| {
+            UnixError::AllocationError(format!("signal fd buffer allocation error: {} bytes", size))
+        })?;
+
+        self.fds
+            .insert(fd.as_raw_fd(), FileType::SignalFd { fd, buf });
 
         Ok(())
     }
-    pub fn reg_pty_child(
+
+    // Установка терминала в режим non-canonical
+    fn set_keypress_mode(termios: &mut Termios) {
+        termios.input_flags &= !(InputFlags::IGNBRK
+            | InputFlags::BRKINT
+            | InputFlags::PARMRK
+            | InputFlags::ISTRIP
+            | InputFlags::INLCR
+            | InputFlags::IGNCR
+            | InputFlags::ICRNL
+            | InputFlags::IXON);
+        termios.output_flags &= !OutputFlags::OPOST;
+        termios.local_flags &= !(LocalFlags::ECHO
+            | LocalFlags::ECHONL
+            | LocalFlags::ICANON
+            | LocalFlags::ISIG
+            | LocalFlags::IEXTEN);
+        termios.control_flags &= !(ControlFlags::CSIZE | ControlFlags::PARENB);
+        termios.control_flags |= ControlFlags::CS8;
+        termios.control_chars[0] = 0;
+        termios.control_chars[1] = 0;
+    }
+
+    pub fn reg_stdin_non_canonical_mode_if_not_exists(
         &mut self,
-        program: &String,
-        args: Option<ValuesRef<String>>,
+        buffer_length: usize,
     ) -> Result<(), UnixError> {
+        // перевожу stdin в режим non canonical для побайтовой обработки вводимых данных
+        // добавляю в контейнер fds для дальнейшего отслеживания событий через poll
+        let fd = std::io::stdin();
+
+        let termios = termios::tcgetattr(&fd)
+            .map_err(|e| UnixError::StdInRegisterError(format!("failed get termios: {:#?}", e)))?;
+        let mut termios_modify = termios.clone();
+        Self::set_keypress_mode(&mut termios_modify);
+        termios::tcsetattr(&fd, SetArg::TCSANOW, &termios_modify).map_err(|e| {
+            UnixError::StdInRegisterError(format!("failed set noncanonical mode stdin: {:#?}", e))
+        })?;
+
+        let buf = Buffer::try_new(buffer_length).map_err(|_e| {
+            UnixError::AllocationError(format!(
+                "stdin buffer allocation error: {} bytes",
+                buffer_length
+            ))
+        })?;
+
+        self.fds
+            .insert(fd.as_raw_fd(), FileType::Stdin { fd, buf, termios });
+
+        Ok(())
+    }
+
+    pub fn reg_stdout_if_not_exists(&mut self, buffer_length: usize) -> Result<(), UnixError> {
+        let fd = std::io::stdout();
+
+        let buf = Buffer::try_new(buffer_length).map_err(|_e| {
+            UnixError::AllocationError(format!(
+                "stdout buffer allocation error: {} bytes",
+                buffer_length
+            ))
+        })?;
+
+        self.fds
+            .insert(fd.as_raw_fd(), FileType::Stdout { fd, buf });
+
+        Ok(())
+    }
+
+    pub fn reg_stderr_if_not_exists(&mut self, buffer_length: usize) -> Result<(), UnixError> {
+        let fd = std::io::stderr();
+
+        let buf = Buffer::try_new(buffer_length).map_err(|_e| {
+            UnixError::AllocationError(format!(
+                "stderr buffer allocation error: {} bytes",
+                buffer_length
+            ))
+        })?;
+
+        self.fds
+            .insert(fd.as_raw_fd(), FileType::Stderr { fd, buf });
+
+        Ok(())
+    }
+
+    pub fn reg_pty_child<S, I>(
+        &mut self,
+        program: S,
+        args: Option<I>,
+        buffer_length: usize,
+    ) -> Result<(), UnixError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         // Создаем псевдотерминал (PTY)
-        let pty = openpty(None, None).expect("Failed to open PTY");
+        let pty = openpty(None, None)
+            .map_err(|e| UnixError::OpenPTYError(format!("openpty error: {}", e)))?;
 
         // fork() - создает дочерний процесс из текущего
         // parent блок это продолжение текущего запущенного процесса
@@ -217,13 +549,9 @@ impl UnixApp {
         // все окружение дочернего процесса наследуется из родительского
         let status = match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                let master = match pty.master.try_clone() {
-                    Err(e) => {
-                        error!("Failed to clone PTY master: {}", e);
-                        return Err(e.into());
-                    }
-                    Ok(master) => master,
-                };
+                let master = pty.master.try_clone().map_err(|e| {
+                    UnixError::OpenPTYError(format!("failed clone pty master: {:#?}", e))
+                })?;
 
                 // Перенаправляем стандартный ввод, вывод и ошибки в псевдотерминал
                 unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCNOTTY) };
@@ -250,444 +578,96 @@ impl UnixApp {
                     .stderr(new_follower_stdio())
                     .exec();
 
-                error!("child error: {e}");
-
-                Err(e.into())
+                Err(UnixError::CommandError(format!("exec failed: {:#?}", e)))
             }
             Ok(ForkResult::Parent { child }) => {
-                // эта исполняется только в родительском процессе
-                // возвращаю pty дескриптор для отслеживания событий через poll
-                self.poller.fds.push_pty_fd(pty, child, PollFlags::POLLIN);
+                let buf = Buffer::try_new(buffer_length).map_err(|_e| {
+                    UnixError::AllocationError(format!(
+                        "pty buffer allocation error: {} bytes",
+                        buffer_length
+                    ))
+                })?;
+
+                // Добавляем дескриптор PTY для мониторинга событий
+                self.fds.insert(
+                    pty.master.as_raw_fd(),
+                    FileType::PtyMaster {
+                        master: pty.master,
+                        buf,
+                        slave: pty.slave,
+                        child,
+                    },
+                );
 
                 Ok(())
             }
-            Err(e) => {
-                error!(
-                    "{:?}: {:?}: Fork failed: {}",
-                    std::thread::current().id(),
-                    std::time::SystemTime::now(),
-                    e
-                );
-                Err(e.into())
-            }
+            Err(e) => Err(UnixError::OpenPTYError(format!(
+                "{:?}: {:?}: Fork failed: {}",
+                std::thread::current().id(),
+                std::time::SystemTime::now(),
+                e
+            ))),
         };
 
         status
     }
 
-    pub fn set_non_canonical_stdin(stdin: &mut StdinLock) -> Result<(), UnixError> {
-        let mut termios_modify = get_termios(stdin.as_raw_fd())?;
-        set_keypress_mode(&mut termios_modify);
-        set_termios(stdin.as_raw_fd(), &termios_modify)?;
-
-        Ok(())
-    }
-
-    pub fn reg_non_canonical_stdin(&mut self) -> Result<(), UnixError> {
-        // перевожу stdin в режим non canonical для побайтовой обработки вводимых данных
-        // добавляю в контейнер fds для дальнейшего отслеживания событий через poll
-        let mut stdin = std::io::stdin().lock();
-        let termios = get_termios(stdin.as_raw_fd())?;
-
-        Self::set_non_canonical_stdin(&mut stdin)?;
-
-        self.poller
+    pub fn make_pollfd(&mut self) -> &mut [libc::pollfd] {
+        let poll_fds = self
             .fds
-            .push_stdin_fd(stdin, termios, PollFlags::POLLIN);
+            .values()
+            .map(|x| libc::pollfd {
+                fd: x.as_raw_fd().as_raw_fd(),
+                events: x.make_events().bits(),
+                revents: PollFlags::empty().bits(),
+            })
+            .collect();
 
-        Ok(())
+        self.pollfds = poll_fds;
+
+        self.pollfds.as_mut_slice()
     }
 
-    pub fn reg_stdout(&mut self) -> Result<(), UnixError> {
-        let stdout = std::io::stdout();
-
-        self.poller.fds.push_stdout_fd(stdout, PollFlags::POLLIN);
-
-        Ok(())
+    pub fn get_fd(&self, raw_fd: RawFd) -> &FileType {
+        self.fds.get(&raw_fd).unwrap()
     }
 
-    pub fn reg_signals(&mut self) -> Result<(), UnixError> {
-        let mut mask = SigSet::empty();
-        // добавляю в обработчик все сигналы
-        for signal in Signal::iterator() {
-            mask.add(signal);
-        }
-
-        let mut new_mask = SigSet::thread_get_mask()?;
-        for s in mask.into_iter() {
-            new_mask.add(s);
-        }
-
-        new_mask.thread_block()?;
-
-        let signal_fd =
-            SignalFd::with_flags(&new_mask, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)?;
-        self.poller.fds.push_signal_fd(signal_fd, PollFlags::POLLIN);
-
-        Ok(())
+    pub fn get_mut_fd(&mut self, raw_fd: RawFd) -> &mut FileType {
+        self.fds.get_mut(&raw_fd).unwrap()
     }
 
-    fn deinit(&mut self) -> Result<(), UnixError> {
-        trace!("deinit fds...");
-        for fd in self.poller.iter() {
-            match &*fd {
-                Fd::Signal { .. } => {}
-                Fd::PtyMaster { .. } => {}
-                Fd::PtySlave { .. } => {}
-                Fd::Stdin { fd, termios, .. } => {
-                    // Восстанавливаем исходные атрибуты терминала
-                    trace!("termios restore: {:#?}", termios);
-                    let res = set_termios(fd.as_raw_fd(), termios);
-                    trace!("termios restore: {:?}", res);
-                }
-                Fd::Stdout { .. } => {}
-            }
-        }
-        trace!("deinit fds");
-
-        Ok(())
+    pub fn get_mut_buf(&mut self, raw_fd: RawFd) -> &mut Buffer {
+        self.get_mut_fd(raw_fd).get_mut_buf()
     }
 
-    // match Signal::try_from(sig.ssi_signo as i32) {
-    //     Ok(Signal::SIGINT) => {
-    //         info!("recv SIGINT");
-    //         return Ok(Some(UnixEvent::Signal(sig)));
-    //         // trace!("kill({}, SIGINT", self.child);
-    //         // if let Err(ESRCH) = kill(self.child, Signal::SIGINT)
-    //         // {
-    //         //     error!("pid {} doesnt exists or zombie", self.child);
-    //         // }
-    //     }
-    //     Ok(Signal::SIGTERM) => {
-    //         info!("recv SIGTERM");
-    //         return Ok(Some(UnixEvent::Signal(sig)));
-    //         // trace!("kill({}, SIGTERM", self.child);
-    //         // if let Err(ESRCH) = kill(self.child, Signal::SIGTERM)
-    //         // {
-    //         //     error!("pid {} doesnt exists or zombie", self.child);
-    //         // }
-    //     }
-    //     Ok(Signal::SIGCHLD) => {
-    //         info!("recv SIGCHLD");
-    //         return Ok(Some(UnixEvent::SignalChildStatus(sig)));
-    //         // return self.waitpid();
-    //     }
-    //     Ok(Signal::SIGWINCH) => {
-    //         info!("recv SIGWINCH");
-    //         return Ok(Some(UnixEvent::SignalToResize(sig)));
-    //         // if let Ok(size) = get_termsize(self.stdin.as_raw_fd()) {
-    //         //     trace!("set termsize: {:#?}", size);
-    //         //     let res = set_termsize(self.pty.slave.as_raw_fd(), size);
-    //         //     trace!("set_termsize: {:#?}", res);
-    //         // }
-    //     }
-    //     Ok(Signal::SIGTSTP) => {
-    //         info!("recv SIGTSTP");
-    //         return Ok(Some(UnixEvent::SignalStop(sig)));
-    //     }
-    //     Ok(signal) => {
-    //         info!("recv signal {:#?}", signal);
-    //         return Ok(Some(UnixEvent::SignalUnknown(sig)));
-    //     }
-    //     Err(e) => {
-    //         error!("recv unknown signal");
-    //         error!("{e}");
-    //         return Err(e.into())
-    //     }
-    // }
-    // unsafe fn get_mut_from_immutble<T>(reference: &T) -> &mut T {
-    //     let const_ptr = reference as *const T;
-    //     let mut_ptr = const_ptr as *mut T;
-    //     &mut *mut_ptr
+    // pub fn stop_code(&self) -> i32 {
+    //     self.shutdown.stop_code()
     // }
 
-    /// Функция читает системное событие
-    /// Если poll сигнализирует что событие есть, то нужно вызвать эту функцию
-    /// Что бы прочитать событие, иначе при следующем вызове poll
-    /// он опять сигнализирует о том, что событие есть и оно не прочитано
-    fn read_event(fd: &mut Fd, buf: &mut [u8]) -> Result<usize, nix::errno::Errno> {
-        trace!("fd reading ({:?})", fd);
-
-        let res = match fd {
-            Fd::Stdin {..} | Fd::Stdout {..} | Fd::PtyMaster { .. } | Fd::Stdout { .. } | Fd::PtySlave { .. } | Fd::Signal { .. } => {
-                { read(fd.as_raw_fd(), buf) }
-            }
-        };
-        
-        match res {
-            Err(EAGAIN) => {
-                // non block
-                trace!(
-                    "non-blocking reading mode is enabled (SFD_NONBLOCK). fd {} doesn't data",
-                    fd
-                );
-                Ok(0)
-            }
-            Err(e) => {
-                // error
-                error!("read = Err({})", e);
-                Err(e)
-            }
-            Ok(0) => {
-                // EOF
-                trace!("read = Ok(0) bytes (EOF)");
-                Ok(0)
-            }
-            Ok(n) => {
-                // read n bytes
-                trace!("read = Ok({n}) bytes");
-                Ok(n)
-            }
-        }
-    }
-
-    // fn map_ref_to_siginfo(bytes: Ref<[u8]>) -> Ref<siginfo> {
-    //     Ref::map(bytes, |slice| {
-    //         // Преобразуем срез байт в ссылку на siginfo
-    //         assert!(
-    //             slice.len() >= std::mem::size_of::<siginfo>(),
-    //             "Slice too small"
-    //         );
-    //         unsafe { &*(slice.as_ptr() as *const siginfo) }
-    //     })
-    // }
-    fn map_ref_to_siginfo(bytes: &mut [u8]) -> &mut siginfo {
-            unsafe { &mut *(bytes.as_ptr() as *mut siginfo) }
-    }
-
-    // fn match_signal_event(&mut self, index: usize, fd: &SignalFd) -> Result<(UnixEvent, &mut AppContext), UnixError> {
-    //     let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_all_slice());
-    //     match res {
-    //         Err(e) => {
-    //             // error
-    //             trace!("signal match Err({:?})", e);
-    //             Err(e.into())
-    //         }
-    //         Ok(0) => {
-    //             // EOF
-    //             trace!("signal match Ok(0) bytes");
-    //             Ok((UnixEvent::ReadZeroBytes, &mut self.context))
-    //         }
-    //         Ok(n) => {
-    //             // read n bytes
-    //             trace!("signal match Ok({n}) bytes");
-    //             trace!("try convert to struct siginfo");
-    //             let buf = self.buf.get_mut_slice(n);
-    //             let res = Self::map_ref_to_siginfo(buf);
-
-    //             let signal = Signal::try_from(res.ssi_signo as i32);
-    //             if let Err(e) = signal {
-    //                 error!("Error converting received bytes to the Signal struct: {e}");
-    //                 return Err(e.into());
-    //             }
-
-    //             let signal = signal.unwrap();
-    //             // let res = *res;
-    //             let res = UnixEvent::Signal(index, signal, res);
-    //             Ok((res, &mut self.context))
-    //         }
-    //     }
+    // pub fn is_stoped(&self) -> bool {
+    //     self.shutdown.is_stoped()
     // }
 
-    // fn match_pty_master_event(&mut self, index: usize, fd: &OwnedFd) -> Result<(UnixEvent, &mut AppContext), UnixError>  {
-    //     let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_all_slice());
-    //     match res {
-    //         Err(e) => {
-    //             // error
-    //             trace!("pty match Err({:?})", e);
-    //             Err(e.into())
-    //         }
-    //         Ok(0) => {
-    //             // EOF
-    //             trace!("pty match Ok(0) bytes");
-    //             Ok((UnixEvent::ReadZeroBytes, &mut self.context))
-    //         }
-    //         Ok(n) => {
-    //             // read n bytes
-    //             trace!("pty match Ok({n}) bytes");
-    //             let buf = self.buf.get_mut_slice(n);
-    //             let res = UnixEvent::PtyMaster(index, buf);
-    //             Ok((res, &mut self.context))
-    //         }
-    //     }
-    // }
-    // fn match_pty_slave_event(&mut self, index: usize, fd: &OwnedFd) -> Result<(UnixEvent, &mut AppContext), UnixError>  {
-    //     let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_all_slice());
-    //     match res {
-    //         Err(e) => {
-    //             // error
-    //             trace!("pty match Err({:?})", e);
-    //             Err(e.into())
-    //         }
-    //         Ok(0) => {
-    //             // EOF
-    //             trace!("pty match Ok(0) bytes");
-    //             Ok((UnixEvent::ReadZeroBytes, &mut self.context))
-    //         }
-    //         Ok(n) => {
-    //             // read n bytes
-    //             trace!("pty match Ok({n}) bytes");
-    //             let buf = self.buf.get_mut_slice(n);
-    //             let res = UnixEvent::PtySlave(index, buf);
-    //             Ok((res, &mut self.context))
-    //         }
-    //     }
-    // }
-    // fn match_stdin_event(&mut self, index: usize, fd: &StdinLock<'static>) -> Result<(UnixEvent, &mut AppContext), UnixError>  {
-    //     let res = Self::read_event(fd.as_raw_fd(), &mut self.buf.get_mut_all_slice());
-    //     match res {
-    //         Err(e) => {
-    //             // error
-    //             trace!("stdin match Err({:?})", e);
-    //             Err(e.into())
-    //         }
-    //         Ok(0) => {
-    //             // EOF
-    //             trace!("stdin match Ok(0) bytes");
-    //             Ok((UnixEvent::ReadZeroBytes, &mut self.context))
-    //         }
-    //         Ok(n) => {
-    //             // read n bytes
-    //             trace!("stdin match Ok({n}) bytes");
-    //             let buf = self.buf.get_mut_slice(n);
-    //             let res = UnixEvent::Stdin(index, buf);
-    //             Ok((res, &mut self.context))
-    //         }
-    //     }
-    // }
+    pub fn event_pocess(
+        &mut self,
+        poll_timeout: i32,
+        // poll_handler: &mut impl PollHandler<UnixApp>,
+    ) -> i32 {
+        trace!("poll(&mut fds, {:?})", poll_timeout);
 
-    pub fn event_handler(&self, event: UnixEvent) -> UnixEventResponse {
-        trace!("event_handler()");
-        // let context = Rc::clone(&self.context);
-        // let mut context = context.deref().borrow_mut();
-        // let handler = Rc::clone(&self.event_handlers);
-        // let mut handler = handler.deref().borrow_mut();
-        // let handler = handler;
-        // let handler = self.event_handlers.clone().get_mut();
-        // let res = handler.handle(
-        //     context,
-        //     event,
-        // );
-
-        // res
-        todo!()
-    }
-
-    pub fn event_system(&mut self) -> Result<(UnixEvent, &mut AppContext), UnixError>  {
-        trace!("poll(&mut fds, {:?})", self.poller.poll_timeout);
-        match self.poller.poll() {
-            Err(e) => {
-                error!("poll calling error: {}", e);
-                return Err(e.into());
-            }
-            Ok(0) => {
-                // timeout
-                // trace!("poll timeout: Ok(0)");
-                return Ok((UnixEvent::PollTimeout, &mut self.context));
-            }
-            Ok(n) => {
-                // match n events
-                trace!("poll match {} events", n);
-            }
+        let poller = self.make_pollfd();
+        let res = unsafe {
+            libc::poll(
+                poller.as_mut_ptr().cast(),
+                poller.len() as libc::nfds_t,
+                poll_timeout,
+            )
         };
 
-        // Извлекаем необходимую информацию из итератора
-        while let Some(fd) = self.poller.revent_next() {
-            let len = Self::read_event(fd, self.buf.get_mut_all_slice());
+        trace!("poll result: {:?}", res);
 
-            let len = match len {
-                Err(e)=> {
-                    error!("poll calling error: {}", e);
-                    return Err(e.into());
-                }
-                Ok(len) => len,
-            };
+        // poll_handler.handle(self, res);
 
-            let buf = self.buf.get_mut_slice(len);
-
-            let event =  match fd {
-                Fd::Signal { .. } => {
-                    trace!("try convert to struct siginfo");
-                    let res = Self::map_ref_to_siginfo(buf);
-
-                    let signal = Signal::try_from(res.ssi_signo as i32);
-                    if let Err(e) = signal {
-                        error!("Error converting received bytes to the Signal struct: {e}");
-                        return Err(e.into());
-                    }
-
-                    let signal = signal.unwrap();
-
-                    UnixEvent::Signal(signal, res)
-                }
-                Fd::PtyMaster { .. } => {
-                    UnixEvent::PtyMaster(buf)
-                }
-                Fd::PtySlave { .. } => {
-                    UnixEvent::PtySlave(buf)
-                }
-                Fd::Stdin { .. } => {
-                    UnixEvent::Stdin(buf)
-                }
-                Fd::Stdout { .. } => {
-                    todo!();
-                }
-            };
-
-            let res = (event, &mut self.context);
-            
-            return Ok(res);
-        }
-
-       Ok((UnixEvent::PollEventNotHandle, &mut self.context))
-    }
-
-    // pub fn send_to(&self, index: usize, buf: &Ref<[u8]>) {
-    //     self.poller.fds.send_to(index, buf)
-    // }
-
-    // pub fn write_to_stdout(&self, buf: &Ref<[u8]>) {
-    //     self.poller.fds.write_to_stdout(buf);
-    // }
-
-    // pub fn write_to_stdin(&self, buf: &Ref<[u8]>) {
-    //     self.poller.fds.write_to_stdin(buf);
-    // }
-
-    // pub fn write_to_pty_master(&self, buf: &Ref<[u8]>) {
-    //     self.poller.fds.write_to_pty_master(buf);
-    // }
-
-    // pub fn write_to_pty_slave(&self, buf: &Ref<[u8]>) {
-    //     self.poller.fds.write_to_pty_slave(buf);
-    // }
-
-
-    pub fn send_to(&mut self, index: usize, buf: &mut [u8]) {
-        self.poller.fds.send_to(index, buf)
-    }
-
-    pub fn write_to_stdout(&mut self, buf: &mut [u8]) {
-        self.poller.fds.write_to_stdout(buf);
-    }
-
-    pub fn write_to_stdin(&mut self, buf: &mut [u8]) {
-        self.poller.fds.write_to_stdin(buf);
-    }
-
-    pub fn write_to_pty_master(&mut self, buf: &mut [u8]) {
-        self.poller.fds.write_to_pty_master(buf);
-    }
-
-    pub fn write_to_pty_slave(&mut self, buf: &mut [u8]) {
-        self.poller.fds.write_to_pty_slave(buf);
-    }
-}
-
-impl Drop for UnixApp {
-    fn drop(&mut self) {
-        if let Err(e) = self.deinit() {
-            error!("deinit error: {:#?}", e);
-        }
+        res
     }
 }
