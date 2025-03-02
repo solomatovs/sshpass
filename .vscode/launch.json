@@ -25,6 +25,10 @@
             ],
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}/.vscode/.env",
+            "setupCommands": [
+                { "text": "-enable-pretty-printing" },
+                { "text": "set disassembly-flavor intel" }
+            ]
         },
         {
             "type": "lldb",

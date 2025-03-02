@@ -1,18 +1,29 @@
 use crate::unix::FileType;
-use crate::unix::UnixContext;
+use crate::unix::{Buffer, UnixContext, UnixError};
 
 use log::{debug, error, info, trace};
+
+use std::collections::VecDeque;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::time::Instant;
+
 use nix::errno::Errno;
+
+use nix::fcntl;
+use nix::libc;
+use nix::unistd::{read, write, Pid};
+
 use nix::poll::PollFlags;
-use nix::sys::signalfd::siginfo;
+
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signalfd::{siginfo, SfdFlags, SignalFd};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::read;
-use nix::unistd::Pid;
-use std::os::fd::RawFd;
 
-
-pub trait PollHandler<C> {
-    fn handle(&mut self, res: i32);
+pub trait PollHandler<C, E> {
+    fn poll_processing(&mut self, res: i32);
+    fn reg_poll_error(&mut self, handler: Box<dyn PollErrorHandler<C, E>>);
+    fn reg_poll_revent(&mut self, handler: Box<dyn PollReventHandler<C>>);
 }
 
 pub trait PollErrorHandler<C, E> {
@@ -21,33 +32,20 @@ pub trait PollErrorHandler<C, E> {
 
 pub trait PollReventHandler<C> {
     fn handle(&mut self, app: &mut C, number_events: i32);
-}
 
-pub trait SignalFdEventHandler<C> {
-    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
-}
-
-pub trait StdinEventHandler<C> {
-    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
-}
-
-pub trait StdoutEventHandler<C> {
-    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
-}
-
-pub trait StderrEventHandler<C> {
-    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
-}
-pub trait PtyEventHandler<C> {
-    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+    fn reg_signalfd(&mut self, handler: Box<dyn SignalFdEventHandler<UnixContext>>);
+    fn reg_stdin(&mut self, handler: Box<dyn StdinEventHandler<UnixContext>>);
+    fn reg_stdout(&mut self, handler: Box<dyn StdoutEventHandler<UnixContext>>);
+    fn reg_stderr(&mut self, handler: Box<dyn StderrEventHandler<UnixContext>>);
+    fn reg_pty(&mut self, handler: Box<dyn PtyEventHandler<UnixContext>>);
 }
 
 pub trait PollInReadHandler<C> {
-    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+    fn read(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
 }
 
 pub trait PollOutHandler<C> {
-    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+    fn write(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
 }
 
 pub trait PollErrHandler<C> {
@@ -62,6 +60,49 @@ pub trait PollHupHandler<C> {
     fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
 }
 
+pub trait SignalFdEventHandler<C> {
+    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>);
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>);
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>);
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>);
+}
+
+pub trait StdinEventHandler<C> {
+    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>);
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>);
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>);
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>);
+}
+
+pub trait StdoutEventHandler<C> {
+    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>);
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>);
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>);
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>);
+}
+
+pub trait StderrEventHandler<C> {
+    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>);
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>);
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>);
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>);
+}
+pub trait PtyEventHandler<C> {
+    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>);
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>);
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>);
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>);
+}
 
 pub struct DefaultPollMiddleware {
     context: UnixContext,
@@ -78,12 +119,15 @@ impl DefaultPollMiddleware {
         }
     }
 
-    pub fn stop_code(&self) -> i32 {
-        self.context.shutdown.stop_code()
+    pub fn exit_code(&self) -> i32 {
+        self.context.shutdown.code().unwrap_or(0)
     }
 
-    pub fn stop_message(&self) -> String {
-        self.context.shutdown.stop_message()
+    pub fn exit_message(&self) -> String {
+        self.context
+            .shutdown
+            .message()
+            .unwrap_or("no message".into())
     }
 
     pub fn poll(&mut self, timeout: i32) -> i32 {
@@ -93,10 +137,69 @@ impl DefaultPollMiddleware {
     pub fn is_stoped(&self) -> bool {
         self.context.shutdown.is_stoped()
     }
+
+    pub fn event_processing(&mut self) {
+        while let Some(task) = self.context.queue.pop_task() {
+            println!("Удаляем {:?}", task);
+        }
+    }
+
+    pub fn add_signals_if_not_exists(&mut self) {
+        if let Err(err) = self.context.add_signal_fd_if_not_exists() {
+            let (stop_code, message) = err.into();
+            self.context
+                .shutdown
+                .shutdown_smart(stop_code, Some(message));
+        }
+    }
+
+    pub fn reg_pty_child(
+        &mut self,
+        program: String,
+        args: Option<Vec<String>>,
+        buffer_length: usize,
+    ) {
+        if let Err(err) = self.context.reg_pty_child(program, args, buffer_length) {
+            let (stop_code, message) = err.into();
+            self.context
+                .shutdown
+                .shutdown_smart(stop_code, Some(message));
+        }
+    }
+
+    pub fn reg_stdin_non_canonical_mode_if_not_exists(&mut self, buffer_length: usize) {
+        if let Err(err) = self
+            .context
+            .reg_stdin_non_canonical_mode_if_not_exists(buffer_length)
+        {
+            let (stop_code, message) = err.into();
+            self.context
+                .shutdown
+                .shutdown_smart(stop_code, Some(message));
+        }
+    }
+
+    pub fn reg_stdout_if_not_exists(&mut self, buffer_length: usize) {
+        if let Err(err) = self.context.reg_stdout_if_not_exists(buffer_length) {
+            let (stop_code, message) = err.into();
+            self.context
+                .shutdown
+                .shutdown_smart(stop_code, Some(message));
+        }
+    }
+
+    pub fn reg_stderr_if_not_exists(&mut self, buffer_length: usize) {
+        if let Err(err) = self.context.reg_stderr_if_not_exists(buffer_length) {
+            let (stop_code, message) = err.into();
+            self.context
+                .shutdown
+                .shutdown_smart(stop_code, Some(message));
+        }
+    }
 }
 
-impl PollHandler<UnixContext> for DefaultPollMiddleware {
-    fn handle(&mut self, res: i32) {
+impl PollHandler<UnixContext, nix::Error> for DefaultPollMiddleware {
+    fn poll_processing(&mut self, res: i32) {
         match Errno::result(res) {
             // poll error, handling
             Err(e) => {
@@ -112,18 +215,24 @@ impl PollHandler<UnixContext> for DefaultPollMiddleware {
             }
         }
     }
-}
 
-pub struct PollErrorMiddleware {}
-impl PollErrorMiddleware {
-    pub fn new() -> Self {
-        Self { 
-            
-        }
+    fn reg_poll_error(&mut self, handler: Box<dyn PollErrorHandler<UnixContext, nix::Error>>) {
+        self.error = Some(handler);
+    }
+
+    fn reg_poll_revent(&mut self, handler: Box<dyn PollReventHandler<UnixContext>>) {
+        self.revent = Some(handler);
     }
 }
 
-impl PollErrorHandler<UnixContext, nix::Error> for PollErrorMiddleware {
+pub struct DefaultPollErrorMiddleware {}
+impl DefaultPollErrorMiddleware {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl PollErrorHandler<UnixContext, nix::Error> for DefaultPollErrorMiddleware {
     fn handle(&mut self, app: &mut UnixContext, err: nix::Error) {
         match err {
             Errno::EINTR => {
@@ -175,29 +284,29 @@ impl DefaultPollReventMiddleware {
             pty: None,
         }
     }
-
-    pub fn reg_signalfd(&mut self, handler: Box<dyn SignalFdEventHandler<UnixContext>>) {
-        self.signalfd = Some(handler);
-    }
-
-    pub fn reg_stdin(&mut self, handler: Box<dyn StdinEventHandler<UnixContext>>) {
-        self.stdin = Some(handler);
-    }
-
-    pub fn reg_stdout(&mut self, handler: Box<dyn StdoutEventHandler<UnixContext>>) {
-        self.stdout = Some(handler);
-    }
-
-    pub fn reg_stderr(&mut self, handler: Box<dyn StderrEventHandler<UnixContext>>) {
-        self.stderr = Some(handler);
-    }
-
-    pub fn reg_pty(&mut self, handler: Box<dyn PtyEventHandler<UnixContext>>) {
-        self.pty = Some(handler);
-    }
 }
 
 impl PollReventHandler<UnixContext> for DefaultPollReventMiddleware {
+    fn reg_signalfd(&mut self, handler: Box<dyn SignalFdEventHandler<UnixContext>>) {
+        self.signalfd = Some(handler);
+    }
+
+    fn reg_stdin(&mut self, handler: Box<dyn StdinEventHandler<UnixContext>>) {
+        self.stdin = Some(handler);
+    }
+
+    fn reg_stdout(&mut self, handler: Box<dyn StdoutEventHandler<UnixContext>>) {
+        self.stdout = Some(handler);
+    }
+
+    fn reg_stderr(&mut self, handler: Box<dyn StderrEventHandler<UnixContext>>) {
+        self.stderr = Some(handler);
+    }
+
+    fn reg_pty(&mut self, handler: Box<dyn PtyEventHandler<UnixContext>>) {
+        self.pty = Some(handler);
+    }
+
     fn handle(&mut self, app: &mut UnixContext, number_events: i32) {
         trace!("number_events: {}", number_events);
 
@@ -289,19 +398,30 @@ impl StdinEventHandler<UnixContext> for DefaultStdinHandler {
         }
         if revents.contains(PollFlags::POLLIN) {
             if let Some(h) = &mut self.pollin {
-                h.handle(app, raw_fd, revents);
+                h.read(app, raw_fd, revents);
             }
         }
     }
-}
 
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>) {
+        self.pollin = Some(handler);
+    }
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>) {
+        self.pollerr = Some(handler);
+    }
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>) {
+        self.pollhup = Some(handler);
+    }
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>) {
+        self.pollnval = Some(handler);
+    }
+}
 
 pub struct DefaultSignalfdMiddleware {
     pollin: Option<Box<dyn PollInReadHandler<UnixContext>>>,
     pollerr: Option<Box<dyn PollErrHandler<UnixContext>>>,
     pollhup: Option<Box<dyn PollHupHandler<UnixContext>>>,
     pollnval: Option<Box<dyn PollNvalHandler<UnixContext>>>,
-
 }
 
 impl DefaultSignalfdMiddleware {
@@ -388,37 +508,64 @@ impl SignalFdEventHandler<UnixContext> for DefaultSignalfdMiddleware {
         }
         if revents.contains(PollFlags::POLLIN) {
             if let Some(h) = &mut self.pollin {
-                h.handle(app, raw_fd, revents);
+                h.read(app, raw_fd, revents);
 
-                // let siginfo = self.map_to_siginfo(buf);
-                // debug!("siginfo = {:#?}", siginfo);
+                let (signal, ssi_pid, ssi_uid, ssi_status, ssi_utime, ssi_stime) = {
+                    let buf = app.get_mut_buf(raw_fd);
+                    let buf = self.map_to_siginfo(buf.get_mut_buffer_slice());
+                    (
+                        Signal::try_from(buf.ssi_signo as i32).unwrap(),
+                        buf.ssi_pid,
+                        buf.ssi_uid,
+                        buf.ssi_status,
+                        buf.ssi_utime,
+                        buf.ssi_stime,
+                    )
+                };
 
-                // let signal = Signal::try_from(siginfo.ssi_signo as i32).unwrap();
-                // debug!("signal = {:#?}", signal);
+                let message = format!("{signal} from pid: {ssi_pid} (uid: {ssi_uid})");
 
-                // if matches!(signal, Signal::SIGINT | Signal::SIGTERM) {
-                //     app.shutdown.shutdown_starting(0, None);
-                //     return;
-                // }
+                debug!("{message}");
 
-                // if matches!(signal, Signal::SIGCHLD) {
-                //     let res = self.waitpid(Pid::from_raw(siginfo.ssi_pid as i32));
-                //     trace!("waitpid({}) = {:#?}", siginfo.ssi_pid, res);
-                // }
-                
+                if signal == Signal::SIGTERM {
+                    app.shutdown.shutdown_smart(0, Some(message.clone()));
+                }
+
+                if signal == Signal::SIGINT {
+                    app.shutdown.shutdown_fast(0, Some(message.clone()));
+                }
+
+                if signal == Signal::SIGQUIT {
+                    app.shutdown.shutdown_immediate(0, Some(message.clone()));
+                }
+
+                if signal == Signal::SIGCHLD {
+                    trace!("status: {ssi_status} (ssi_utime: {ssi_utime}, ssi_stime: {ssi_stime})");
+                    let res = self.waitpid(Pid::from_raw(ssi_pid as i32));
+                    trace!("waitpid({}) = {:#?}", ssi_pid, res);
+                }
             }
         }
     }
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>) {
+        self.pollin = Some(handler);
+    }
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>) {
+        self.pollerr = Some(handler);
+    }
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>) {
+        self.pollhup = Some(handler);
+    }
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>) {
+        self.pollnval = Some(handler);
+    }
 }
-
-
 
 pub struct DefaultPtyMiddleware {
     pollin: Option<Box<dyn PollInReadHandler<UnixContext>>>,
     pollerr: Option<Box<dyn PollErrHandler<UnixContext>>>,
     pollhup: Option<Box<dyn PollHupHandler<UnixContext>>>,
     pollnval: Option<Box<dyn PollNvalHandler<UnixContext>>>,
-
 }
 
 impl DefaultPtyMiddleware {
@@ -451,115 +598,173 @@ impl PtyEventHandler<UnixContext> for DefaultPtyMiddleware {
         }
         if revents.contains(PollFlags::POLLIN) {
             if let Some(h) = &mut self.pollin {
-                h.handle(app, raw_fd, revents);
+                h.read(app, raw_fd, revents);
             }
         }
     }
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>) {
+        self.pollin = Some(handler);
+    }
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>) {
+        self.pollerr = Some(handler);
+    }
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>) {
+        self.pollhup = Some(handler);
+    }
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>) {
+        self.pollnval = Some(handler);
+    }
 }
 
-pub struct DefaultPollInReadHandler {
-}
+pub struct DefaultPollInReadHandler {}
 
 impl DefaultPollInReadHandler {
     pub fn new() -> Self {
-        Self { 
-
-        }
+        Self {}
     }
 }
 
 impl PollInReadHandler<UnixContext> for DefaultPollInReadHandler {
-    fn handle(&mut self, app: &mut UnixContext, raw_fd: RawFd, revents: PollFlags) {
+    fn read(&mut self, app: &mut UnixContext, raw_fd: RawFd, revents: PollFlags) {
         trace!("fd {} ready for reading", raw_fd);
 
         let buf = app.get_mut_buf(raw_fd);
 
-        // Читаем данные и обрабатываем их
-        match read(raw_fd, buf.get_mut_all_slice()) {
-            Ok(n) => {
-                // read n bytes
-                trace!("read = Ok({n}) bytes");
-                buf.set_len(n);
-            }
-            Err(Errno::EAGAIN) => {
-                // дескриптор установлен в неблокирующий режим, но данных пока нет. Верно просто пропускать и ждать следующего срабатывания poll.
-                trace!(
-                    "non-blocking reading mode is enabled (SFD_NONBLOCK). fd {:?} doesn't data",
-                    raw_fd,
-                );
-                // continue;
-            }
-            Err(Errno::EBADF) => {
-                // Аргумент fd не является допустимым дескриптором файла, открытым для чтения.
-                // Это может значить, что он был закрыт или никогда не существовал.
-                // Удалить его из списка наблюдаемых дескрипторов.
-            }
-            Err(Errno::EINTR) => {
-                // Операция чтения была прервана из-за получения сигнала, и данные не были переданы.
-                // Здесь можно просто повторить read
-            }
-            Err(Errno::EINVAL) => {
-                // Файл является обычным или блочным специальным файлом, а аргумент смещение отрицательный. Смещение файла должно оставаться неизменным.
-                // если возникает, стоит логировать, так как это признак ошибки в коде (например, передан неверный аргумент offset).
-            }
-            Err(Errno::ECONNRESET) => {
-                // Была предпринята попытка чтения из сокета, и соединение было принудительно закрыто его партнёром.
-                // соединение было закрыто принудительно, нужно закрыть дескриптор и удалить его из списка.
-            }
-            Err(Errno::ENOTCONN) => {
-                // Была предпринята попытка чтения из сокета, который не подключен.
-                // сокет не подключен, тоже стоит удалить fd.
-            }
-            Err(Errno::ETIMEDOUT) => {
-                // Была предпринята попытка чтения из сокета, и произошел тайм-аут передачи.
-                // тайм-аут соединения. Если это TCP-сокет, вероятно, соединение закрылось → удалить fd.
-            }
-            Err(Errno::EIO) => {
-                // Произошла физическая ошибка ввода-вывода.
-                // Это может быть связано с проблемами на уровне железа, стоит логировать и удалить fd.
-            }
-            Err(Errno::ENOBUFS) => {
-                // В системе было недостаточно ресурсов для выполнения этой операции.
-                // нехватка ресурсов. Можно попробовать повторить позже, но если ошибка повторяется, логировать и, возможно, завершить работу (в зависимости от критичности).
-            }
-            Err(Errno::ENOMEM) => {
-                // Для выполнения запроса недостаточно памяти
-                // нехватка ресурсов. Можно попробовать повторить позже, но если ошибка повторяется, логировать и, возможно, завершить работу (в зависимости от критичности).
-            }
-            Err(Errno::ENXIO) => {
-                // Был отправлен запрос несуществующему устройству или запрос выходил за рамки возможностей устройства.
-                // устройство не существует или запрос вне его диапазона. Вероятно, fd устарел, его следует удалить.
-            }
-            Err(e) => {
-                error!("read = Err({})", e);
+        let mut retry = 10;
+
+        while retry > 0 {
+            // Читаем данные и обрабатываем их
+            let res = read(raw_fd, buf.get_mut_buffer_slice());
+
+            match res {
+                Ok(n) => {
+                    // read n bytes
+                    trace!("read = Ok({n}) bytes");
+                    buf.set_data_len(n);
+                    retry = 0;
+                }
+                Err(Errno::EAGAIN) => {
+                    // дескриптор установлен в неблокирующий режим, но данных пока нет. Верно просто пропускать и ждать следующего срабатывания poll.
+                    trace!(
+                        "non-blocking reading mode is enabled (SFD_NONBLOCK). fd {:?} doesn't data",
+                        raw_fd,
+                    );
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::EBADF) => {
+                    // Аргумент fd не является допустимым дескриптором файла, открытым для чтения.
+                    // Это может значить, что он был закрыт или никогда не существовал.
+                    // Удалить его из списка наблюдаемых дескрипторов.
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::EINTR) => {
+                    // Операция чтения была прервана из-за получения сигнала, и данные не были переданы.
+                    // Здесь можно просто повторить read
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::EINVAL) => {
+                    // Файл является обычным или блочным специальным файлом, а аргумент смещение отрицательный.
+                    // ошибка может возникать если передан некорретный buf, например нулевой длинны
+                    // если возникает, стоит логировать, так как это признак ошибки в коде (например, передан неверный аргумент offset).
+                    trace!("fd {} EINVAL", raw_fd);
+                    let setting_len = buf.get_setting_len();
+                    let buffer_len = buf.get_buffer_len();
+
+                    if retry > 0 {
+                        trace!("buffer_len = {buffer_len}, setting_len = {setting_len}");
+                        let new_buffer_len = if buffer_len < setting_len {
+                            // если текущий буфер меньше, чем размер, который установил пользователь
+                            //то увеличим его до размера, который установил пользователь
+                            setting_len
+                        } else {
+                            // если текущий буфер больше размера, установленного пользователем,
+                            // однако все равно не удалось прочитать данные и была получена ошибка EINVAL
+                            // то надо попробовать увеличить размер буфера в 2 раза и повторить чтение
+                            buffer_len * 2
+                        };
+
+                        trace!("set buffer_len to {new_buffer_len} and read fd: {raw_fd} retry");
+                        buf.reallocate(new_buffer_len);
+                        retry -= 1;
+                    } else {
+                        buf.set_data_len(0);
+                        retry = 0;
+                    }
+                }
+                Err(Errno::ECONNRESET) => {
+                    // Была предпринята попытка чтения из сокета, и соединение было принудительно закрыто его партнёром.
+                    // соединение было закрыто принудительно, нужно закрыть дескриптор и удалить его из списка.
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::ENOTCONN) => {
+                    // Была предпринята попытка чтения из сокета, который не подключен.
+                    // сокет не подключен, тоже стоит удалить fd.
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::ETIMEDOUT) => {
+                    // Была предпринята попытка чтения из сокета, и произошел тайм-аут передачи.
+                    // тайм-аут соединения. Если это TCP-сокет, вероятно, соединение закрылось → удалить fd.
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::EIO) => {
+                    // Произошла физическая ошибка ввода-вывода.
+                    // Это может быть связано с проблемами на уровне железа, стоит логировать и удалить fd.
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::ENOBUFS) => {
+                    // В системе было недостаточно ресурсов для выполнения этой операции.
+                    // нехватка ресурсов. Можно попробовать повторить позже, но если ошибка повторяется, логировать и, возможно, завершить работу (в зависимости от критичности).
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::ENOMEM) => {
+                    // Для выполнения запроса недостаточно памяти
+                    // нехватка ресурсов. Можно попробовать повторить позже, но если ошибка повторяется, логировать и, возможно, завершить работу (в зависимости от критичности).
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(Errno::ENXIO) => {
+                    // Был отправлен запрос несуществующему устройству или запрос выходил за рамки возможностей устройства.
+                    // устройство не существует или запрос вне его диапазона. Вероятно, fd устарел, его следует удалить.
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
+                Err(e) => {
+                    error!("read = Err({})", e);
+                    buf.set_data_len(0);
+                    retry = 0;
+                }
             }
         }
     }
 }
 
-pub struct DefaultPollOutHandler {
-}
+pub struct DefaultPollOutHandler {}
 
 impl DefaultPollOutHandler {
     pub fn new() -> Self {
-        Self { 
-
-        }
+        Self {}
     }
 }
 
 impl PollOutHandler<UnixContext> for DefaultPollOutHandler {
-    fn handle(&mut self, app: &mut UnixContext, raw_fd: RawFd, revents: PollFlags) {
+    fn write(&mut self, app: &mut UnixContext, raw_fd: RawFd, revents: PollFlags) {
         trace!("fd {} ready for writing", raw_fd);
     }
 }
 
-pub struct DefaultPollErrHandler {
-}
+pub struct DefaultPollErrHandler {}
 
 impl DefaultPollErrHandler {
     pub fn new() -> Self {
-        Self { }
+        Self {}
     }
 }
 
@@ -569,13 +774,11 @@ impl PollErrHandler<UnixContext> for DefaultPollErrHandler {
     }
 }
 
-pub struct DefaultPollNvalHandler {
-
-}
+pub struct DefaultPollNvalHandler {}
 
 impl DefaultPollNvalHandler {
     pub fn new() -> Self {
-        Self { }
+        Self {}
     }
 }
 
@@ -585,12 +788,11 @@ impl PollNvalHandler<UnixContext> for DefaultPollNvalHandler {
     }
 }
 
-pub struct DefaultPollHupHandler {
-}
+pub struct DefaultPollHupHandler {}
 
 impl DefaultPollHupHandler {
     pub fn new() -> Self {
-        Self { }
+        Self {}
     }
 }
 

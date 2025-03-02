@@ -1,6 +1,6 @@
 #![feature(allocator_api)]
 
-use clap::{Arg, ArgGroup, Command};
+use clap::{value_parser, Arg, ArgGroup, Command};
 
 use log::{info, trace};
 use std::str::FromStr;
@@ -9,7 +9,13 @@ mod app;
 
 #[cfg(target_os = "linux")]
 mod unix;
-use unix::{DefaultPollMiddleware, PollHandler, UnixContext};
+use unix::{
+    DefaultPollErrHandler, DefaultPollErrorMiddleware, DefaultPollHupHandler,
+    DefaultPollInReadHandler, DefaultPollMiddleware, DefaultPollNvalHandler, DefaultPollOutHandler,
+    DefaultPollReventMiddleware, DefaultPtyMiddleware, DefaultSignalfdMiddleware,
+    DefaultStdinHandler, PollHandler, PollReventHandler, PtyEventHandler, SignalFdEventHandler,
+    StdinEventHandler, UnixContext,
+};
 
 fn cli() -> Command {
     Command::new("sshpass")
@@ -130,6 +136,14 @@ fn cli() -> Command {
                 ]),
         )
         .arg(
+            Arg::new("poll_timeout")
+                .long("poll_timeout")
+                .value_name("POLL_TIMEOUT")
+                .help("poll timeout in milliseconds")
+                .default_value("60000")
+                .value_parser(value_parser!(i32)),
+        )
+        .arg(
             Arg::new("program")
                 .help("Program to execute")
                 .required(true)
@@ -169,40 +183,52 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     let (stop_code, stop_message) = {
-        let timeout: i32 = *args.get_one::<i32>("poll_timeout").unwrap_or(&2000);
+        let poll_timeout = *args.get_one::<i32>("poll_timeout").unwrap();
 
-        let default_buffer_size = *args
-            .get_one::<usize>("default_buffer_size")
-            .unwrap_or(&4096);
+        // let default_buffer_size = *args
+        //     .get_one::<usize>("default_buffer_size")
+        //     .unwrap_or(&4096);
 
-        // app.bootstrap_base(default_buffer_size);
+        let poll_error_handler = DefaultPollErrorMiddleware::new();
+        let mut poll_revent_handler = DefaultPollReventMiddleware::new();
 
-        // let program = args.get_one::<String>("program").unwrap();
-        // let program_args = args.get_many::<String>("program_args");
-        // app.bootstrap_child(program, program_args, default_buffer_size);
+        let mut signalfd_handler = DefaultSignalfdMiddleware::new();
+        let mut stdin_handler = DefaultStdinHandler::new();
+        let mut pty_handler = DefaultPtyMiddleware::new();
 
-        // let mut poll_event_handler = EventMiddleware::new();
-        // let poll_in = Box::new(PollInHandler::new());
-        // let poll_out = Box::new(PollOutHandler::new());
-        // let poll_err = Box::new(PollErrHandler::new());
-        // let poll_hup = Box::new(PollHupHandler::new());
-        // let poll_nval = Box::new(PollNvalHandler::new());
-        // poll_event_handler.reg_pollin(poll_in);
-        // poll_event_handler.reg_pollout(poll_out);
-        // poll_event_handler.reg_pollerr(poll_err);
-        // poll_event_handler.reg_pollhup(poll_hup);
-        // poll_event_handler.reg_pollnval(poll_nval);
+        signalfd_handler.reg_pollin(Box::new(DefaultPollInReadHandler::new()));
+        signalfd_handler.reg_pollerr(Box::new(DefaultPollErrHandler::new()));
+        signalfd_handler.reg_pollnval(Box::new(DefaultPollNvalHandler::new()));
+        signalfd_handler.reg_pollhup(Box::new(DefaultPollHupHandler::new()));
 
-        // let mut poll_error_handler = PollErrorMiddleware::new();
+        stdin_handler.reg_pollin(Box::new(DefaultPollInReadHandler::new()));
+        stdin_handler.reg_pollerr(Box::new(DefaultPollErrHandler::new()));
+        stdin_handler.reg_pollnval(Box::new(DefaultPollNvalHandler::new()));
+        stdin_handler.reg_pollhup(Box::new(DefaultPollHupHandler::new()));
 
-        let mut app = DefaultPollMiddleware::new(UnixContext::new());
+        pty_handler.reg_pollin(Box::new(DefaultPollInReadHandler::new()));
+        pty_handler.reg_pollerr(Box::new(DefaultPollErrHandler::new()));
+        pty_handler.reg_pollnval(Box::new(DefaultPollNvalHandler::new()));
+        pty_handler.reg_pollhup(Box::new(DefaultPollHupHandler::new()));
+
+        poll_revent_handler.reg_signalfd(Box::new(signalfd_handler));
+        poll_revent_handler.reg_stdin(Box::new(stdin_handler));
+        poll_revent_handler.reg_pty(Box::new(pty_handler));
+
+        let mut app = DefaultPollMiddleware::new(UnixContext::new(1024));
+        app.reg_poll_error(Box::new(poll_error_handler));
+        app.reg_poll_revent(Box::new(poll_revent_handler));
+
+        app.add_signals_if_not_exists();
+        app.add_signals_if_not_exists();
 
         while !app.is_stoped() {
-            let res = app.poll(timeout);
-            app.handle(res);
+            let res = app.poll(poll_timeout);
+            app.poll_processing(res);
+            app.event_processing();
         }
 
-        (app.stop_code(), app.stop_message())
+        (app.exit_code(), app.exit_message())
     };
 
     info!("app exit");
