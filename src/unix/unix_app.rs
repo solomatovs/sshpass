@@ -7,6 +7,7 @@ use std::ops::{Deref, DerefMut};
 // use std::io::{Read, Stdin, StdinLock};
 // use std::ops::{Deref, DerefMut};
 use nix::pty::openpty;
+use nix::sys::eventfd::EventFd;
 use nix::unistd::Pid;
 use nix::unistd::{fork, ForkResult};
 use std::ffi::OsStr;
@@ -15,14 +16,16 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 
-use nix::libc;
+use nix::libc::{self, timerfd_settime};
 use nix::poll::PollFlags;
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::signalfd::{siginfo, SfdFlags, SignalFd};
-
 use nix::fcntl;
-
 use nix::sys::termios::{self, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios};
+use nix::sys::time::{TimeSpec, TimeVal, TimeValLike};
+use nix::sys::timer::{Timer, Expiration, TimerSetTimeFlags};
+use nix::sys::timerfd::{TimerFd, ClockId, TimerFlags};
+
 
 use log::trace;
 
@@ -344,6 +347,14 @@ pub enum FileType {
         slave: OwnedFd,
         child: Pid,
     },
+    TimerFd {
+        fd: TimerFd,
+        buf: Buffer,
+    },
+    EventFd {
+        fd: EventFd,
+        buf: Buffer,
+    },
 }
 
 impl std::fmt::Display for FileType {
@@ -381,6 +392,22 @@ impl std::fmt::Display for FileType {
                     buf.data_len
                 )
             }
+            FileType::TimerFd { fd, buf } => {
+                write!(
+                    f,
+                    "TimerFd(fd: {}, buf_size: {})",
+                    fd.as_fd().as_raw_fd(),
+                    buf.data_len
+                )
+            }
+            FileType::EventFd { fd, buf } => {
+                write!(
+                    f,
+                    "EventFd(fd: {}, buf_size: {})",
+                    fd.as_fd().as_raw_fd(),
+                    buf.data_len
+                )
+            }
             FileType::PtyMaster {
                 master, buf, child, ..
             } => {
@@ -404,6 +431,8 @@ impl FileType {
             FileType::Stderr { fd, .. } => fd.as_fd(),
             FileType::SignalFd { fd, .. } => fd.as_fd(),
             FileType::PtyMaster { master, .. } => master.as_fd(),
+            FileType::TimerFd { fd, .. } => fd.as_fd(),
+            FileType::EventFd { fd, .. } => fd.as_fd(),
         }
     }
 
@@ -414,6 +443,8 @@ impl FileType {
             FileType::Stderr { fd, .. } => fd.as_raw_fd(),
             FileType::SignalFd { fd, .. } => fd.as_raw_fd(),
             FileType::PtyMaster { master, .. } => master.as_raw_fd(),
+            FileType::TimerFd { fd, .. } => fd.as_fd().as_raw_fd(),
+            FileType::EventFd { fd, .. } => fd.as_fd().as_raw_fd(),
         }
     }
 
@@ -431,12 +462,18 @@ impl FileType {
             FileType::SignalFd { .. } => {
                 PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL
             }
+            FileType::TimerFd { .. } => {
+                PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL
+            }
             FileType::PtyMaster { .. } => {
                 PollFlags::POLLIN
                     | PollFlags::POLLOUT
                     | PollFlags::POLLERR
                     | PollFlags::POLLHUP
                     | PollFlags::POLLNVAL
+            }
+            FileType::EventFd { .. } => {
+                PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL
             }
         }
     }
@@ -448,6 +485,8 @@ impl FileType {
             FileType::Stderr { buf, .. } => buf,
             FileType::SignalFd { buf, .. } => buf,
             FileType::PtyMaster { buf, .. } => buf,
+            FileType::TimerFd { buf, .. } => buf,
+            FileType::EventFd { buf, .. } => buf,
         }
     }
 }
@@ -590,28 +629,28 @@ impl UnixContext {
     //     self.handler = Some(Box::new(handler));
     // }
 
-    pub fn bootstrap_base(&mut self, buffer_size: usize) {
-        self.reg_stdin_non_canonical_mode_if_not_exists(buffer_size)
-            .and_then(|_| self.reg_stdout_if_not_exists(buffer_size))
-            .and_then(|_| self.reg_stderr_if_not_exists(buffer_size))
-            .and_then(|_| self.add_signal_fd_if_not_exists())
-            .map_err(|e| {
-                self.shutdown
-                    .shutdown_smart(-1, Some(format!("error bootstraping app: {:#?}", e)));
-            });
-    }
+    // pub fn bootstrap_base(&mut self, buffer_size: usize) {
+    //     self.reg_stdin_non_canonical_mode_if_not_exists(buffer_size)
+    //         .and_then(|_| self.reg_stdout_if_not_exists(buffer_size))
+    //         .and_then(|_| self.reg_stderr_if_not_exists(buffer_size))
+    //         .and_then(|_| self.add_signal_fd_if_not_exists())
+    //         .map_err(|e| {
+    //             self.shutdown
+    //                 .shutdown_smart(-1, Some(format!("error bootstraping app: {:#?}", e)));
+    //         });
+    // }
 
-    pub fn bootstrap_child<S, I>(&mut self, program: S, args: Option<I>, buffer_length: usize)
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        self.reg_pty_child(program, args, buffer_length)
-            .map_err(|e| {
-                self.shutdown
-                    .shutdown_smart(-1, Some(format!("error bootstraping app: {:#?}", e)));
-            });
-    }
+    // pub fn bootstrap_child<S, I>(&mut self, program: S, args: Option<I>, buffer_length: usize)
+    // where
+    //     I: IntoIterator<Item = S>,
+    //     S: AsRef<OsStr>,
+    // {
+    //     self.reg_pty_child(program, args, buffer_length)
+    //         .map_err(|e| {
+    //             self.shutdown
+    //                 .shutdown_smart(-1, Some(format!("error bootstraping app: {:#?}", e)));
+    //         });
+    // }
 
     pub fn get_signal_raw_fd(&mut self) -> Option<RawFd> {
         self.fds.values().find_map(|x| match x {
@@ -831,7 +870,6 @@ impl UnixContext {
                         buffer_length
                     ))
                 })?;
-                // let buf = Buffer::new(buffer_length);
 
                 self.fds.insert(
                     pty.master.as_raw_fd(),
@@ -854,6 +892,41 @@ impl UnixContext {
         };
 
         status
+    }
+        
+    // Создадим timerfd с задержкой
+    fn create_timer(&mut self, expiration: Expiration, buffer_length: usize) -> Result<(), UnixError> {
+        // Другие варианты часов в Linux
+        // CLOCK_MONOTONIC - Это тип часов, используемый для измерения времени. Он не зависит от системного времени (в отличие от CLOCK_REALTIME). Это означает, что его значение не изменяется при изменении времени системы, что полезно для измерения интервалов.
+        // CLOCK_REALTIME – системные часы, могут изменяться при корректировке времени (например, NTP или вручную).
+        // CLOCK_BOOTTIME – как CLOCK_MONOTONIC, но учитывает время сна (suspend).
+        // CLOCK_MONOTONIC_RAW – “сырой” монотонный таймер без коррекций частоты CPU.
+        // CLOCK_PROCESS_CPUTIME_ID – измеряет CPU-время только текущего процесса.
+        // CLOCK_THREAD_CPUTIME_ID – измеряет CPU-время только текущего потока.
+        let fd = TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::TFD_NONBLOCK | TimerFlags::TFD_CLOEXEC).map_err(|e| {
+            UnixError::TimerFdError(format!("TimerFd create failed error: {:#?}", e))
+        })?;
+
+        fd.set(expiration, TimerSetTimeFlags::empty()).map_err(|e| {
+            UnixError::TimerFdError(format!("TimerFd set expiration {:#?} failed error: {:#?}", expiration, e))
+        })?;
+
+        let buf = Buffer::try_new(buffer_length).map_err(|_e| {
+            UnixError::AllocationError(format!(
+                "timerfd buffer allocation error: {} bytes",
+                buffer_length
+            ))
+        })?;
+
+        self.fds.insert(
+            fd.as_fd().as_raw_fd(),
+            FileType::TimerFd {
+                fd,
+                buf,
+            },
+        );
+
+        Ok(())
     }
 
     pub fn make_pollfd(&mut self) -> &mut [libc::pollfd] {

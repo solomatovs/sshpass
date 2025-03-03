@@ -11,6 +11,7 @@ pub enum UnixError {
     PTYCommandError(String),
     SignalFdError(String),
     StdInRegisterError(String),
+    TimerFdError(String),
 }
 
 impl From<UnixError> for i32 {
@@ -21,6 +22,7 @@ impl From<UnixError> for i32 {
             UnixError::PTYCommandError(_) => 3,
             UnixError::SignalFdError(_) => 4,
             UnixError::StdInRegisterError(_) => 5,
+            UnixError::TimerFdError(_) => 6,
         }
     }
 }
@@ -33,6 +35,7 @@ impl std::fmt::Display for UnixError {
             UnixError::PTYCommandError(msg) => write!(f, "PTY Command Error: {}", msg),
             UnixError::SignalFdError(msg) => write!(f, "SignalFd Error: {}", msg),
             UnixError::StdInRegisterError(msg) => write!(f, "StdIn Register Error: {}", msg),
+            UnixError::TimerFdError(msg) => write!(f, "TimerFd Error: {}", msg),
         }
     }
 }

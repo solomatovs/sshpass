@@ -103,6 +103,24 @@ pub trait PtyEventHandler<C> {
     fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>);
     fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>);
 }
+pub trait TimerFdEventHandler<C> {
+    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>);
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>);
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>);
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>);
+}
+
+pub trait EventFdEventHandler<C> {
+    fn handle(&mut self, app: &mut C, raw_fd: RawFd, revents: PollFlags);
+
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>);
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>);
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>);
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>);
+}
+
 
 pub struct DefaultPollMiddleware {
     context: UnixContext,
@@ -140,7 +158,7 @@ impl DefaultPollMiddleware {
 
     pub fn event_processing(&mut self) {
         while let Some(task) = self.context.queue.pop_task() {
-            println!("Удаляем {:?}", task);
+            debug!("delete {:?}", task);
         }
     }
 
@@ -273,6 +291,8 @@ pub struct DefaultPollReventMiddleware {
     stdout: Option<Box<dyn StdoutEventHandler<UnixContext>>>,
     stderr: Option<Box<dyn StderrEventHandler<UnixContext>>>,
     pty: Option<Box<dyn PtyEventHandler<UnixContext>>>,
+    timerfd: Option<Box<dyn TimerFdEventHandler<UnixContext>>>,
+    eventfd: Option<Box<dyn EventFdEventHandler<UnixContext>>>,
 }
 impl DefaultPollReventMiddleware {
     pub fn new() -> Self {
@@ -282,6 +302,8 @@ impl DefaultPollReventMiddleware {
             stdout: None,
             stderr: None,
             pty: None,
+            timerfd: None,
+            eventfd: None,
         }
     }
 }
@@ -350,6 +372,16 @@ impl PollReventHandler<UnixContext> for DefaultPollReventMiddleware {
                 FileType::PtyMaster { .. } => {
                     if let Some(h) = &mut self.pty {
                         h.handle(app, pfd.fd, revents);
+                    }
+                }
+                FileType::TimerFd { fd, buf: _buf } => {
+                    if let Some(h) = &mut self.timerfd {
+                        h.handle(app, fd.as_fd().as_raw_fd(), revents);
+                    }
+                }
+                FileType::EventFd { fd, buf: _buf } => {
+                    if let Some(h) = &mut self.eventfd {
+                        h.handle(app, fd.as_fd().as_raw_fd(), revents);
                     }
                 }
             }
@@ -615,6 +647,117 @@ impl PtyEventHandler<UnixContext> for DefaultPtyMiddleware {
         self.pollnval = Some(handler);
     }
 }
+
+pub struct DefaultTimerFdMiddleware {
+    pollin: Option<Box<dyn PollInReadHandler<UnixContext>>>,
+    pollerr: Option<Box<dyn PollErrHandler<UnixContext>>>,
+    pollhup: Option<Box<dyn PollHupHandler<UnixContext>>>,
+    pollnval: Option<Box<dyn PollNvalHandler<UnixContext>>>,
+}
+
+impl DefaultTimerFdMiddleware {
+    pub fn new() -> Self {
+        Self {
+            pollin: None,
+            pollerr: None,
+            pollhup: None,
+            pollnval: None,
+        }
+    }
+}
+
+impl TimerFdEventHandler<UnixContext> for DefaultTimerFdMiddleware {
+    fn handle(&mut self, app: &mut UnixContext, raw_fd: RawFd, revents: PollFlags) {
+        if revents.contains(PollFlags::POLLERR) {
+            if let Some(h) = &mut self.pollerr {
+                h.handle(app, raw_fd, revents);
+            }
+        }
+        if revents.contains(PollFlags::POLLNVAL) {
+            if let Some(h) = &mut self.pollnval {
+                h.handle(app, raw_fd, revents);
+            }
+        }
+        if revents.contains(PollFlags::POLLHUP) {
+            if let Some(h) = &mut self.pollhup {
+                h.handle(app, raw_fd, revents);
+            }
+        }
+        if revents.contains(PollFlags::POLLIN) {
+            if let Some(h) = &mut self.pollin {
+                h.read(app, raw_fd, revents);
+            }
+        }
+    }
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>) {
+        self.pollin = Some(handler);
+    }
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>) {
+        self.pollerr = Some(handler);
+    }
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>) {
+        self.pollhup = Some(handler);
+    }
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>) {
+        self.pollnval = Some(handler);
+    }
+}
+
+pub struct DefaultEventFdMiddleware {
+    pollin: Option<Box<dyn PollInReadHandler<UnixContext>>>,
+    pollerr: Option<Box<dyn PollErrHandler<UnixContext>>>,
+    pollhup: Option<Box<dyn PollHupHandler<UnixContext>>>,
+    pollnval: Option<Box<dyn PollNvalHandler<UnixContext>>>,
+}
+
+impl DefaultEventFdMiddleware {
+    pub fn new() -> Self {
+        Self {
+            pollin: None,
+            pollerr: None,
+            pollhup: None,
+            pollnval: None,
+        }
+    }
+}
+
+impl EventFdEventHandler<UnixContext> for DefaultEventFdMiddleware {
+    fn handle(&mut self, app: &mut UnixContext, raw_fd: RawFd, revents: PollFlags) {
+        if revents.contains(PollFlags::POLLERR) {
+            if let Some(h) = &mut self.pollerr {
+                h.handle(app, raw_fd, revents);
+            }
+        }
+        if revents.contains(PollFlags::POLLNVAL) {
+            if let Some(h) = &mut self.pollnval {
+                h.handle(app, raw_fd, revents);
+            }
+        }
+        if revents.contains(PollFlags::POLLHUP) {
+            if let Some(h) = &mut self.pollhup {
+                h.handle(app, raw_fd, revents);
+            }
+        }
+        if revents.contains(PollFlags::POLLIN) {
+            if let Some(h) = &mut self.pollin {
+                h.read(app, raw_fd, revents);
+            }
+        }
+    }
+    fn reg_pollin(&mut self, handler: Box<dyn PollInReadHandler<UnixContext>>) {
+        self.pollin = Some(handler);
+    }
+    fn reg_pollerr(&mut self, handler: Box<dyn PollErrHandler<UnixContext>>) {
+        self.pollerr = Some(handler);
+    }
+    fn reg_pollhup(&mut self, handler: Box<dyn PollHupHandler<UnixContext>>) {
+        self.pollhup = Some(handler);
+    }
+    fn reg_pollnval(&mut self, handler: Box<dyn PollNvalHandler<UnixContext>>) {
+        self.pollnval = Some(handler);
+    }
+}
+
 
 pub struct DefaultPollInReadHandler {}
 
