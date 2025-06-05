@@ -11,11 +11,11 @@
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=sshpass",
-                    "--package=sshpass"
+                    "--bin=app",
+                    "--package=app"
                 ],
                 "filter": {
-                    "name": "sshpass",
+                    "name": "app",
                     "kind": "bin"
                 }
             },

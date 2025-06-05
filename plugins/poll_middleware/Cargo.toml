@@ -1,0 +1,16 @@
+[package]
+name = "poll_middleware"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[lib]
+crate-type = ["cdylib"]  # Делает плагин динамической библиотекой
+
+
+[dependencies]
+abstractions = { path = "../../abstractions" }
+nix = { version = "0.29.0", features = ["fs", "term", "process", "signal", "poll", "ioctl", "time", "event"] }
+# simplelog = { version = "0.12.2", features = ["paris", "termcolor", "local-offset"] }
+log = {version = "0.4.22"}
+# clap = { version = "4.5.9", features = ["derive", "env"] }

@@ -1,0 +1,17 @@
+[package]
+name = "poll"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[lib]
+name = "poll"
+crate-type = ["cdylib"]  # Делает плагин динамической библиотекой
+
+
+[dependencies]
+abstractions = { path = "../../abstractions" }
+common = { path = "../../common" }
+nix = { version = "0.29.0", features = ["fs", "term", "process", "signal", "poll", "ioctl", "time", "event"] }
+log = {version = "0.4.22"}
+simplelog = { version = "0.12.2", features = ["paris", "termcolor", "local-offset"] }
