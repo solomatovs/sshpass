@@ -47,7 +47,7 @@
 // };
 use abstractions::UnixContext;
 
-use crate::plugin::{PluginLoader, ManagedPlugin};
+use common::plugin::{PluginLoader, ManagedPlugin};
 
 // pub struct OrderedFdEventHandler<C> {
 //     order: usize,
@@ -130,7 +130,7 @@ impl App {
         };
 
         if let Err(e) = res.load_plugins("config.toml") {
-            res.context.shutdown.to_smart_stop();
+            res.context.shutdown.shutdown_smart();
             res.context.shutdown.set_message(e);
             res.context.shutdown.set_code(-1);
         }
@@ -161,7 +161,7 @@ impl App {
                 1 => {
                     self.handlers
                         .remove(i)
-                        .drop(&mut self.context);
+                        .free(&mut self.context);
                 }
                 _ => {
                     i += 1;

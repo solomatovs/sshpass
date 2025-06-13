@@ -1,5 +1,6 @@
 [plugins]
 order = [
-    { name = "target/debug/libpoll.so", required = true },  # Обязательный плагин (объект)
-    { name = "target/debug/libsignal.so", required = false }, # Необязательный плагин
+    { name = "target/debug/liblogfile.so", required = true },   # обязательный плагин для логирования
+    { name = "target/debug/libpoll.so", required = true },      # Обязательный плагин (объект)
+    { name = "target/debug/libsignal.so", required = true },    # Необязательный плагин
 ]

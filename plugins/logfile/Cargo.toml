@@ -1,11 +1,11 @@
 [package]
-name = "poll"
+name = "logfile"
 version = "0.1.0"
 edition = "2021"
 resolver = "2"
 
 [lib]
-name = "poll"
+name = "logfile"
 crate-type = ["cdylib"]  # Делает плагин динамической библиотекой
 
 

@@ -1,178 +1,180 @@
-use std::ops::{Deref, DerefMut};
-use std::alloc::{self, AllocError, Layout};
+use std::mem::size_of;
+use thiserror::Error;
 
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Buffer {
     buf: Vec<u8>,
     data_len: usize,
-    setup_len: usize,
+    // Смещение от начала: сколько байт уже прочитано/записано
+    data_offset: usize,
+}
+
+/// Ошибки, которые могут возникнуть при работе с буфером (чтение, преобразование и т.д.)
+#[derive(Debug, Error)]
+pub enum BufferError {
+    /// Ошибка возникает, если текущая длина данных в буфере меньше, чем размер запрашиваемой структуры.
+    /// Например, попытка прочитать `signalfd_siginfo` (128 байт), когда в буфере только 4 байта.
+    #[error("Buffer is too small to read structure: required {required} bytes, but only {available} available")]
+    DataLenIsLessReadableType {
+        /// Требуемый размер структуры в байтах
+        required: usize,
+
+        /// Фактически доступный размер данных в буфере
+        available: usize,
+
+        /// Имя типа структуры, которую пытались прочитать (например, "signalfd_siginfo")
+        type_name: &'static str,
+    },
+
+    /// Ошибка выравнивания.
+    /// Некоторые типы (например, структуры) требуют определённого выравнивания памяти для корректной интерпретации.
+    /// Если указатель на начало буфера не соответствует выравниванию типа, чтение будет небезопасным.
+    #[error("Buffer alignment error: required alignment {required}, but pointer is misaligned")]
+    AlignError {
+        /// Требуемое выравнивание в байтах (обычно зависит от архитектуры и структуры)
+        required: usize,
+
+        /// Имя типа, для которого проверялось выравнивание
+        type_name: &'static str,
+    },
 }
 
 impl Buffer {
-    pub fn new(setup_len: usize) -> Self {
-        Self {
-            buf: vec![0; setup_len],
+    pub fn new(capacity: usize) -> Self {
+        let mut buf = vec![0; capacity];
+        // Заполняем нулями до capacity (для безопасного доступа)
+        buf.resize(capacity, 0);
+
+        Buffer {
+            buf,
             data_len: 0,
-            setup_len,
+            data_offset: 0,
         }
     }
 
-    pub fn try_new(setup_len: usize) -> Result<Self, AllocError> {
-        // Обработка случая с нулевой емкостью
-        if setup_len == 0 {
-            return Ok(Self {
-                buf: Vec::new(),
-                data_len: 0,
-                setup_len,
+    pub fn from_vec(vec: Vec<u8>) -> Self {
+        let data_len = vec.len();
+        Buffer {
+            buf: vec,
+            data_len,
+            data_offset: 0,
+        }
+    }
+
+    /// Получить срез данных для чтения
+    pub fn as_data_slice(&self) -> &[u8] {
+        &self.buf[self.data_offset..self.data_len]
+    }
+
+    /// Получить срез данных для записи
+    pub fn as_mut_data_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[self.data_offset..self.data_len]
+    }
+
+    /// Получить срез свободного места для чтения
+    pub fn as_free_slice(&mut self) -> &[u8] {
+        &self.buf[self.data_len..]
+    }
+
+    /// Получить срез свободного места для записи
+    pub fn as_mut_free_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[self.data_len..]
+    }
+
+    /// Удалить первые `n` байт из буфера (сдвинуть offset)
+    pub fn consume(&mut self, n: usize) {
+        self.data_offset += n;
+        if self.data_offset >= self.data_len {
+            self.clear(); // всё потреблено — сбрасываем полностью
+        }
+    }
+
+    /// Попробовать вычитать структуру из начала буфера
+    pub fn try_read_struct<T>(&self) -> Result<&T, BufferError> {
+        let size = size_of::<T>();
+        let align = std::mem::align_of::<T>();
+
+        let available = self.data_len.saturating_sub(self.data_offset);
+
+        if available < size {
+            return Err(BufferError::DataLenIsLessReadableType {
+                required: size,
+                available,
+                type_name: std::any::type_name::<T>(),
             });
         }
 
-        // Проверка на переполнение при выделении памяти
-        let layout = match Layout::array::<u8>(setup_len) {
-            Ok(layout) => layout,
-            Err(_) => return Err(AllocError),
-        };
+        let ptr = unsafe { self.buf.as_ptr().add(self.data_offset) };
 
-        unsafe {
-            // Попытка выделить память
-            let ptr = alloc::alloc(layout);
-
-            // Проверка на ошибку аллокации
-            if ptr.is_null() {
-                return Err(AllocError);
-            }
-
-            // Преобразование в Vec
-            // это корректный вариант
-            // let buf = Vec::from_raw_parts(ptr, setup_len, setup_len);
-            // это для стресс тестирования, заранее выделил некорректный размер буфера, программа должна адаптироваться и менять значение буфера на нужное
-            let buf = Vec::from_raw_parts(ptr, 0, 0);
-            Ok(Self {
-                buf,
-                data_len: 0,
-                setup_len,
-            })
+        if ptr.align_offset(align) != 0 {
+            return Err(BufferError::AlignError {
+                required: align,
+                type_name: std::any::type_name::<T>(),
+            });
         }
+
+        let reference = unsafe { &*(ptr as *const T) };
+        Ok(reference)
     }
 
-    pub fn set_data_len(&mut self, data_len: usize) {
-        self.data_len = data_len;
+    pub fn clear(&mut self) {
+        self.data_len = 0;
+        self.data_offset = 0;
     }
 
     pub fn get_data_len(&self) -> usize {
-        self.data_len
+        self.data_len - self.data_offset
     }
 
-    pub fn get_setting_len(&mut self) -> usize {
-        self.setup_len
-    }
-
-    pub fn get_buffer_len(&self) -> usize {
-        self.buf.len()
-    }
-
-    pub fn reallocate(&mut self, set_size: usize) {
-        self.buf.resize(set_size, 0);
-
-        if self.data_len > set_size {
-            // если данные больше нового размера буфера, то обнуляем data_len
-            // так как этот размер неверен и при чтении можно получить ошибку
-            self.data_len = 0;
+    pub fn set_data_len(&mut self, data_len: usize) -> Result<(), String> {
+        if data_len > self.buf.len() {
+            return Err(format!(
+                "data_len ({data_len}) exceeds physical buffer size ({})",
+                self.buf.len()
+            ));
         }
+        self.data_len = data_len;
 
-        self.setup_len = set_size;
-    }
-
-    pub fn get_data_slice(&self) -> &[u8] {
-        &self.buf[..self.data_len]
-    }
-
-    pub fn get_mut_data_slice(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.data_len]
-    }
-
-    pub fn get_mut_buffer_slice(&mut self) -> &mut [u8] {
-        &mut self.buf[..]
-    }
-}
-
-impl Deref for Buffer {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.buf[..self.data_len]
-    }
-}
-
-impl DerefMut for Buffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buf[..self.data_len]
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BufferPool {
-    buffers: Vec<Buffer>,
-    max_size: usize,
-    buffer_size: usize,
-}
-
-impl BufferPool {
-    pub fn try_new(max_size: usize, buffer_size: usize) -> Result<Self, AllocError> {
-        Ok(Self {
-            buffers: Vec::new(), // Пустой вектор не вызовет ошибку аллокации
-            max_size,
-            buffer_size,
-        })
-    }
-
-    pub fn try_add_buffer(&mut self, buffer: Buffer) -> Result<(), AllocError> {
-        if self.buffers.len() < self.max_size {
-            // try_reserve для одного элемента
-            self.buffers.try_reserve(1).map_err(|_| AllocError)?;
-            self.buffers.push(buffer);
-        }
         Ok(())
     }
 
-    // Этот метод не требует изменений, так как не аллоцирует память
-    pub fn get_next_buffer(&mut self) -> Option<Buffer> {
-        self.buffers.pop()
+    pub fn grow_data_len(&mut self, n: usize) -> Result<(), String> {
+        self.set_data_len(self.get_offset() + self.get_data_len() + n)
     }
 
-    pub fn try_allocate_buffer(&mut self) -> Result<Option<Buffer>, AllocError> {
-        if self.buffers.len() < self.max_size {
-            Buffer::try_new(self.buffer_size).map(Some)
-        } else {
-            Ok(None)
+    pub fn resize(&mut self, new_size: usize) {
+        self.buf.resize(new_size, 0);
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    pub fn get_offset(&self) -> usize {
+        self.data_offset
+    }
+}
+
+impl From<&str> for Buffer {
+    fn from(s: &str) -> Self {
+        let bytes = s.as_bytes().to_vec();
+        let data_len = bytes.len();
+        Buffer {
+            buf: bytes,
+            data_len,
+            data_offset: 0,
         }
     }
 }
 
-impl IntoIterator for BufferPool {
-    type Item = Buffer;
-    type IntoIter = std::vec::IntoIter<Buffer>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.buffers.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a BufferPool {
-    type Item = &'a Buffer;
-    type IntoIter = std::slice::Iter<'a, Buffer>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.buffers.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a mut BufferPool {
-    type Item = &'a mut Buffer;
-    type IntoIter = std::slice::IterMut<'a, Buffer>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.buffers.iter_mut()
+impl From<String> for Buffer {
+    fn from(s: String) -> Self {
+        let bytes = s.as_bytes().to_vec();
+        let data_len = bytes.len();
+        Buffer {
+            buf: bytes,
+            data_len,
+            data_offset: 0,
+        }
     }
 }

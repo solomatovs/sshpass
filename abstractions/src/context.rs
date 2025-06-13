@@ -20,7 +20,29 @@
 // use nix::sys::timer::{Expiration, TimerSetTimeFlags};
 // use nix::sys::timerfd::{ClockId, TimerFd, TimerFlags};
 
-use crate::{AppShutdown, UnixPoll};
+
+use crate::{AppShutdown, LogBufferStack, UnixPoll};
+
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct UnixContext {
+    pub poll: UnixPoll,
+    pub shutdown: AppShutdown,
+    pub log_buffer: LogBufferStack,
+}
+
+impl UnixContext {
+    pub fn new(poll_timeout: i32) -> Self {
+        // Создаем контейнер для дескрипторов, который будет опрашиваться через poll
+        Self {
+            poll: UnixPoll::new(poll_timeout),
+            shutdown: AppShutdown::default(),
+            // стековая очередь сообщений логов
+            log_buffer: LogBufferStack::new(),
+        }
+    }
+}
 
 // #[derive(Debug)]
 // #[repr(C)]
@@ -192,21 +214,6 @@ use crate::{AppShutdown, UnixPoll};
 //     }
 // }
 
-#[derive(Debug)]
-#[repr(C)]
-pub struct UnixContext {
-    pub poll: UnixPoll,
-    pub shutdown: AppShutdown,
-}
-
-impl UnixContext {
-    pub fn new(poll_timeout: i32) -> Self {
-        // Создаем контейнер для дескрипторов, который будет опрашиваться через poll
-        Self {
-            poll: UnixPoll::new(poll_timeout),
-            shutdown: AppShutdown::default(),
-        }
-    }
 
     // pub fn event_pocess(&mut self) -> i32 {
     //     // trace!("poll(&mut fds, {:?})", poll_timeout);
@@ -528,4 +535,3 @@ impl UnixContext {
     // pub fn get_mut_buf(&mut self, raw_fd: RawFd) -> &mut Buffer {
     //     self.get_mut_fd(raw_fd).get_mut_buf()
     // }
-}

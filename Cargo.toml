@@ -7,4 +7,5 @@ members = [
     "app",
     "plugins/poll",
     "plugins/signal",
+    "plugins/logfile",
 ]
