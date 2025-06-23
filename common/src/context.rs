@@ -21,15 +21,16 @@
 // use nix::sys::timerfd::{ClockId, TimerFd, TimerFlags};
 
 
-use crate::{AppShutdown, LogBufferStack, UnixPoll};
+use abstractions::{AppShutdown, LogBufferStack, UnixPoll, AppContext};
+// use crate::plugins_info::PluginsInfo;
 
 
 #[derive(Debug)]
-#[repr(C)]
 pub struct UnixContext {
     pub poll: UnixPoll,
     pub shutdown: AppShutdown,
     pub log_buffer: LogBufferStack,
+    pub reload_config: bool,
 }
 
 impl UnixContext {
@@ -40,8 +41,13 @@ impl UnixContext {
             shutdown: AppShutdown::default(),
             // стековая очередь сообщений логов
             log_buffer: LogBufferStack::new(),
+            reload_config: false,
         }
     }
+}
+
+
+impl AppContext for UnixContext {
 }
 
 // #[derive(Debug)]

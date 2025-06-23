@@ -3,12 +3,12 @@
 use nix::errno::Errno;
 use nix::libc;
 use std::os::raw::c_int;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use thiserror::Error;
 
-use abstractions::{ShutdownType, UnixContext, PluginRust, PluginRegistrator, trace, info, debug, error};
-// use common::init_log::init_log;
+use abstractions::{ShutdownType, PluginRust, trace, info, debug, error};
+use common::UnixContext;
 
 // Определяем типы ошибок, которые могут возникнуть в плагине
 #[derive(Debug, Error)]
@@ -37,14 +37,14 @@ impl PluginError {
 }
 
 // Определяем структуру для нашего плагина в Rust-стиле
-#[repr(C)]
+#[derive(Debug)]
 pub struct PollPlugin {
     error_count: usize,           // Счетчик ошибок для отслеживания повторяющихся проблем
     max_errors: usize,            // Максимальное количество ошибок до завершения плагина
     consecutive_errors: usize,    // Счетчик последовательных ошибок
     max_consecutive_errors: usize, // Максимальное количество последовательных ошибок
     last_success: Instant,        // Время последнего успешного вызова poll
-    max_error_interval: Duration, // Максимальный интервал между успешными вызовами
+    // max_error_interval: Duration, // Максимальный интервал между успешными вызовами
     poll_count: u64,              // Счетчик вызовов poll для статистики
     error_types: Vec<Errno>,      // История типов ошибок для анализа
 }
@@ -59,7 +59,7 @@ impl PollPlugin {
             consecutive_errors: 0,
             max_consecutive_errors: 5,       // Максимальное количество последовательных ошибок
             last_success: Instant::now(),
-            max_error_interval: Duration::from_secs(60), // 1 минута без успешных вызовов - критическая ошибка
+            // max_error_interval: Duration::from_secs(60), // 1 минута без успешных вызовов - критическая ошибка
             poll_count: 0,
             error_types: Vec::with_capacity(10),
         }
@@ -237,11 +237,9 @@ impl PluginRust<UnixContext> for PollPlugin {
 /// - The `UnixContext` pointed to by `ctx` remains valid for the duration of the call
 /// - The `UnixContext` is not being mutably accessed from other parts of the code during this call
 #[no_mangle]
-pub extern "Rust" fn register_rust_plugin(registrator: &mut PluginRegistrator<UnixContext>) -> Result<(), String> {
-    let plugin = PollPlugin::new(registrator.get_context());
+pub extern "Rust" fn register_rust_plugin(ctx: &mut UnixContext) -> Result<Box<dyn PluginRust<UnixContext>>, String> {
+    let plugin = PollPlugin::new(ctx);
     let plugin = Box::new(plugin);
 
-    registrator.add_plugin(plugin);
-
-    Ok(())
+    Ok(plugin)
 }

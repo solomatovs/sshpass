@@ -8,4 +8,5 @@ members = [
     "plugins/poll",
     "plugins/signal",
     "plugins/logfile",
+    "plugins/config_watcher",
 ]

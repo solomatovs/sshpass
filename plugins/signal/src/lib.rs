@@ -11,10 +11,11 @@ use nix::sys::signalfd::{siginfo, SfdFlags, SignalFd};
 
 use thiserror::Error;
 
-use abstractions::{PluginRegistrator, PluginRust, ShutdownType, UnixContext, error, info, trace, warn};
+use abstractions::{PluginRust, ShutdownType, error, info, trace, warn};
 // use common::init_log::init_log;
 use common::read_fd::{read_fd, ReadResult};
 use abstractions::buffer::{Buffer, BufferError};
+use common::UnixContext;
 
 // Определяем типы ошибок, которые могут возникнуть в плагине
 #[derive(Debug, Error)]
@@ -46,7 +47,7 @@ impl PluginError {
 }
 
 // Определяем структуру для нашего плагина в Rust-стиле
-#[repr(C)]
+#[derive(Debug)]
 pub struct SignalFdPlugin {
     fd: SignalFd,
     buf: Buffer,
@@ -457,13 +458,9 @@ impl PluginRust<UnixContext> for SignalFdPlugin {
 /// - The `UnixContext` pointed to by `ctx` remains valid for the duration of the call
 /// - The `UnixContext` is not being mutably accessed from other parts of the code during this call
 #[no_mangle]
-pub extern "Rust" fn register_rust_plugin(
-    registrator: &mut PluginRegistrator<UnixContext>,
-) -> Result<(), String> {
-    let plugin = SignalFdPlugin::new(registrator.get_context())?;
+pub extern "Rust" fn register_rust_plugin(ctx: &mut UnixContext) -> Result<Box<dyn PluginRust<UnixContext>>, String> {
+    let plugin = SignalFdPlugin::new(ctx)?;
     let plugin = Box::new(plugin);
 
-    registrator.add_plugin(plugin);
-
-    Ok(())
+    Ok(plugin)
 }

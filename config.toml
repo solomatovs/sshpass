@@ -1,6 +1,20 @@
-[plugins]
-order = [
-    { name = "target/debug/liblogfile.so", required = true },   # обязательный плагин для логирования
-    { name = "target/debug/libpoll.so", required = true },      # Обязательный плагин (объект)
-    { name = "target/debug/libsignal.so", required = true },    # Необязательный плагин
-]
+[plugins.signal]
+enable = true
+path = "target/debug/libsignal.so"
+order = 2
+
+[plugins.logger]
+enable = true
+path = "target/debug/liblogfile.so"
+order = 100
+
+[plugins.poll]
+enable = true
+path = "target/debug/libpoll.so"
+order = 1
+
+[plugins.config_watcher]
+path = "target/debug/libconfig_watcher.so2"
+enable = true
+order = 10  # Порядок загрузки (после основных плагинов)
+ 

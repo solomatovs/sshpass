@@ -11,9 +11,34 @@ nix = { version = "0.30.1", features = ["fs", "term", "process", "signal", "poll
 # simplelog = { version = "0.12.2", features = ["paris", "termcolor", "local-offset"] }
 # log = {version = "0.4.22"}
 # clap = { version = "4.5.9", features = ["derive", "env"] }
+thiserror = "2.0.12"
 libloading = { version = "0.8.6" }
 toml = "0.8.20"
 
 [[bin]]
 name = "app"
 path = "src/main.rs"
+
+
+
+[features]
+default = ["log_queue_max_len_8192", "log_message_max_len_64"]
+log_queue_max_len_128 = []
+log_queue_max_len_256 = []
+log_queue_max_len_512 = []
+log_queue_max_len_1024 = []
+log_queue_max_len_2048 = []
+log_queue_max_len_4096 = []
+log_queue_max_len_8192 = []
+
+log_message_max_len_1 = []
+log_message_max_len_2 = []
+log_message_max_len_4 = []
+log_message_max_len_8 = []
+log_message_max_len_16 = []
+log_message_max_len_32 = []
+log_message_max_len_64 = []
+log_message_max_len_128 = []
+log_message_max_len_256 = []
+log_message_max_len_512 = []
+log_message_max_len_1024 = []

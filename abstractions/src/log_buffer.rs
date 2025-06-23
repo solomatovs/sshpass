@@ -1,8 +1,9 @@
 
-use std::os::fd::RawFd;
 use std::{fmt::Debug, str};
-use std::os::raw::{c_char, c_void};
-use nix::libc::{write, gettimeofday, localtime_r, strftime, timeval, suseconds_t, tm};
+use std::os::raw::c_char;
+use std::sync::Arc;
+use nix::sys::eventfd::EventFd;
+use nix::libc::{gettimeofday, localtime_r, strftime, timeval, suseconds_t, tm};
 
 use thiserror::Error;
 use heapless::spsc::Queue;
@@ -23,10 +24,6 @@ pub enum LogError {
     /// Ошибка вызова `gettimeofday` — не удалось получить текущее время.
     #[error("Failed to get current time using gettimeofday()")]
     GetTimeOfDayError,
-
-    /// Ошибка буффера — не удалось добавить запись в буффер.
-    #[error("Failed to enqueue log entry")]
-    LogBufferFull,
 }
 
 /// Уровни логирования
@@ -142,7 +139,7 @@ impl LogEntryStack {
 
         let tm_struct = tm.unwrap();
 
-        Self::format_usec_3digits(tm_struct.tv_usec)
+        Self::format_usec_6digits(tm_struct.tv_usec)
     }
 
     fn get_level_buffer(level: &Option<LogLevel>) -> ([u8; LOG_LEVEL_SIZE], usize) {
@@ -203,7 +200,7 @@ impl LogEntryStack {
         (buf, offset)
     }
 
-    fn format_usec_3digits(usec: suseconds_t) -> ([u8; LOG_MICROS_SIZE], usize) {
+    fn format_usec_6digits(usec: suseconds_t) -> ([u8; LOG_MICROS_SIZE], usize) {
         // Ограничим только первые LOG_MICROS_SIZE знака
         // Пример: 123456 -> 123, 4 -> 004
         let digits = [
@@ -230,7 +227,7 @@ impl LogEntryStack {
 #[derive(Debug)]
 pub struct LogBufferStack {
     inner: Queue<LogEntryStack, LOG_QUEUE_MAX_LEN>,
-    event_fd: Option<RawFd>,
+    event_fd: Option<Arc<EventFd>>,
 }
 
 impl LogBufferStack {
@@ -269,16 +266,17 @@ impl LogBufferStack {
     }
 
     fn notify_event_fd(&mut self) {
-        if let Some(fd) = self.event_fd {
-            let val: u64 = 1;
-            let _ = unsafe {
-                write(fd, &val as *const u64 as *const c_void, std::mem::size_of::<u64>())
-            };
+        if let Some(event_fd) = &self.event_fd {
+            // Используем безопасный метод write из EventFd
+            if let Err(_) = event_fd.write(1) {
+                // Ошибки можно игнорировать, так как это просто уведомление
+                // Если нужно, можно добавить логирование
+            }
         }
     }
 
-    pub fn set_notify_event_fd(&mut self, fd: Option<RawFd>) {
-        self.event_fd = fd;
+    pub fn set_notify_event_fd(&mut self, event_fd: Option<Arc<EventFd>>) {
+        self.event_fd = event_fd;
     }
 
     pub fn log(&mut self, level: LogLevel, msg: &str) -> Result<(), LogError> {

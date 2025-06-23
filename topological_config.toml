@@ -1,0 +1,14 @@
+[plugins.signal]
+path = "target/debug/libsignal.so"
+required = true
+depend = ["poll"]
+
+[plugins.logfile]
+path = "target/debug/liblogfile.so"
+required = true
+depend = []
+
+[plugins.poll]
+path = "target/debug/libpoll.so"
+required = true
+depend = ["logfile"]

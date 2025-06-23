@@ -1,0 +1,16 @@
+[package]
+name = "config_watcher"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[lib]
+name = "config_watcher"
+crate-type = ["cdylib"]  # Делает плагин динамической библиотекой
+
+
+[dependencies]
+abstractions = { path = "../../abstractions" }
+common = { path = "../../common" }
+nix = { version = "0.29.0", features = ["fs", "term", "process", "signal", "poll", "ioctl", "time", "event"] }
+thiserror = "2.0.12"

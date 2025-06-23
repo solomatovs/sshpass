@@ -1,11 +1,12 @@
 mod app;
-mod plugin;
 use app::App;
-use abstractions::UnixContext;
+use common::UnixContext;
 
 
 fn main() {
     let mut app = App::new(UnixContext::new(1024));
+    
+    app.reload_config();
 
     let (stop_code, _stop_message) = {
         while !app.is_stoped() {
@@ -15,8 +16,5 @@ fn main() {
         (app.exit_code(), app.exit_message())
     };
 
-    // info!("exit code {stop_code} message {stop_message:?}");
-
     std::process::exit(stop_code);
 }
-

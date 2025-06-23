@@ -1,147 +1,98 @@
 use libloading::{Library, Symbol};
 use std::fs;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::time::SystemTime;
+
 use toml::Value;
 use thiserror::Error;
 
 use abstractions::{
-    PluginRegistrator, PluginType, RegisterCPluginFn,
-    RegisterRustPluginFn, UnixContext,
-    warn,
+    warn, CPluginFn, PluginC, PluginLoadError, PluginType, RustPluginFn, PluginTopologicalConfig, PluginOrderedConfig, Plugin, PluginManager,
 };
 
+use crate::UnixContext;
 
+// Определяем типы ошибок, которые могут возникнуть в плагине
 #[derive(Debug, Error)]
-pub enum PluginLoadError {
-    #[error("Ошибка загрузки символа `{symbol_name}`: {error}")]
-    SymbolLoadError {
-        symbol_name: String,
-        error: libloading::Error,
-    },
-
-    #[error("Метод `{symbol_name}` не найден")]
-    SymbolNotFound {
-        symbol_name: String,
-    },
-
-    #[error("Вызов метода: `{symbol_name}` завершился ошибкой `{error}`.")]
-    PluginInitFailed {
-        symbol_name: String,
-        error: String,
-    },
-}
-
-#[derive(Debug, Error)]
-pub enum LibraryLoadError {
-    #[error("Не удалось загрузить библиотеку {}: {}", library_name, error)]
-    LibraryLoadError {
-        library_name: String,
+pub enum PluginConfigError {
+    #[error("config read error: {}", error)]
+    ReadFileError {
         error: String,
     },
 
-    #[error("Не удалось найти символы {symbols_name:?} в библиотеке {library_name}")]
-    SymbolsNotFound {
-        library_name: String,
-        symbols_name: String,
-    },
-
-    #[error("символ {symbol_name} не определен в библиотеке {library_name}")]
-    SymbolUndefined {
-        library_name: String,
-        symbol_name: String,
-    },
-
-    #[error("Ошибка загрузки символа `{symbol_name}` в библиотеке `{library_name}`: {error}")]
-    SymbolLoadError {
-        library_name: String,
-        symbol_name: String,
-        error: libloading::Error,
-    },
-
-    #[error("Вызов метода: `{symbol_name}` завершился ошибкой `{error}`. Инициализация плагина `{library_name}` невозможна")]
-    PluginInitFailed {
-        library_name: String,
-        symbol_name: String,
+    #[error("config syntax error: {}", error)]
+    ParsingError {
         error: String,
     },
+
+    #[error("plugin {} syntax error: {}", plugin_name, error)]
+    PluginParsingError {
+        plugin_name: String,
+        error: String,
+    },
+
+    #[error("missing required plugins: {plugins:?}")]
+    PluginMissingError {
+        plugins: Vec<String>
+    }
 }
 
-
-/// Управляемый плагин, который владеет указателем на PluginInterface и соответствующей библиотекой.
-/// Автоматически вызывает инициализацию при создании и освобождение ресурсов при уничтожении.
-pub struct ManagedPlugin {
-    plugin: PluginType<UnixContext>,    // Храним указатель на плагин
-    _library: Arc<Library>,             // Храним библиотеку, чтобы она не выгрузилась
+// Добавим новую структуру для отслеживания изменений в конфигурации
+#[derive(Debug)]
+pub enum PluginConfigChange {
+    Add(PluginOrderedConfig),      // Новый плагин для добавления
+    Remove(String),                // Имя плагина для удаления
+    Reload(PluginOrderedConfig),   // Плагин для перезагрузки
+    Disable(String),               // Плагин для отключения
+    Enable(PluginOrderedConfig),   // Плагин для включения
+    NoChange(String),              // Плагин без изменений
 }
 
-impl ManagedPlugin{
-    pub fn try_load_library(plugin_name: &str) -> Result<Arc<Library>, LibraryLoadError> {
+pub struct PluginLoader {}
+
+impl PluginLoader {
+    pub fn try_load_library(plugin_name: &str) -> Result<Library, PluginLoadError> {
         let library = unsafe {
             Library::new(plugin_name)
-                .map_err(|e| LibraryLoadError::LibraryLoadError {
+                .map_err(|e| PluginLoadError::LibraryLoadError {
                     library_name: plugin_name.to_string(),
                     error: e.to_string(),
                 })?
         };
 
-        Ok(Arc::new(library))
+        Ok(library)
     }
 
-    pub fn try_load_plugin(library_name: &str, ctx: &mut UnixContext) -> Result<Vec<Self>, LibraryLoadError> {
-        let library = Self::try_load_library(library_name)?;
+    pub fn try_load_plugin(plugin_name: &str, ctx: &mut UnixContext) -> Result<PluginType<UnixContext, Library>, PluginLoadError> {
         let match_symbols = [
             "register_rust_plugin",
             "register_c_plugin",
         ];
 
-        let mut res = vec![];
-
         for symbol_name in match_symbols {
-            let plugins = match symbol_name {
-                "register_rust_plugin" => {
-                    Self::try_load_rust_plugin(library.clone(), symbol_name, ctx)
-                }
-                "register_c_plugin" => {
-                    Self::try_load_c_plugin(library.clone(), symbol_name, ctx)
-                }
-                _ => {
-                    return Err(LibraryLoadError::SymbolUndefined {
-                        library_name: library_name.to_string(),
-                        symbol_name: symbol_name.to_string(),
-                    });
-                }
-            };
-
-            match plugins {
-                Err(PluginLoadError::SymbolNotFound { symbol_name: _ }) => {
-                    continue;
-                }
-                Err(PluginLoadError::PluginInitFailed { symbol_name, error }) => {
-                    return Err(LibraryLoadError::PluginInitFailed {
-                        library_name: library_name.to_string(),
-                        symbol_name,
-                        error,
-                    });
-                }
-                Err(PluginLoadError::SymbolLoadError { symbol_name, error }) => {
-                    return Err(LibraryLoadError::SymbolLoadError {
-                        library_name: library_name.to_string(),
-                        symbol_name,
-                        error,
-                    });
-                }
-                Ok(plugins) => res.extend(plugins),
+            // Пробуем загрузить как Rust плагин
+            match Self::try_load_rust_plugin(plugin_name, symbol_name, ctx) {
+                Ok(plugin) => return Ok(plugin),
+                Err(PluginLoadError::SymbolNotFound { .. }) => {
+                    // Символ не найден, пробуем следующий метод или символ
+                },
+                Err(e) => return Err(e), // Другие ошибки должны быть переданы выше
+            }
+            
+            // Пробуем загрузить как C плагин
+            match Self::try_load_c_plugin(plugin_name, symbol_name, ctx) {
+                Ok(plugin) => return Ok(plugin),
+                Err(PluginLoadError::SymbolNotFound { .. }) => {
+                    // Символ не найден, пробуем следующий символ
+                },
+                Err(e) => return Err(e), // Другие ошибки должны быть переданы выше
             }
         }
 
-        if res.is_empty() {
-            return Err(LibraryLoadError::SymbolsNotFound {
-                library_name: library_name.to_string(),
-                symbols_name: match_symbols.join(", "),
-            })
-        }
-
-        Ok(res)
+        return Err(PluginLoadError::SymbolNotFound {
+            library_name: plugin_name.to_string(),
+            symbols_name: match_symbols.join(", "),
+        });
     }
 
     /// Создает новый экземпляр ManagedPlugin, инициализируя плагин.
@@ -153,42 +104,64 @@ impl ManagedPlugin{
     /// # Returns
     /// * `Result<Self, String>` - Успешно созданный ManagedPlugin или сообщение об ошибке
     pub fn try_load_c_plugin(
-        library: Arc<Library>,
+        plugin_name: &str,
         symbol_name: &str,
         ctx: &mut UnixContext,
-    ) -> Result<Vec<Self>, PluginLoadError> {
-        let new: Symbol<RegisterCPluginFn<UnixContext>> = unsafe {
-            library
+    ) -> Result<PluginType<UnixContext, Library>, PluginLoadError> {
+        let library = match Self::try_load_library(plugin_name) {
+            Ok(lib) => lib,
+            Err(e) => return Err(e),
+        };
+        
+        let new: Symbol<CPluginFn<UnixContext>> = unsafe {
+            let res = library
                 .get(symbol_name.as_bytes())
                 .map_err(|e| match e {
                     libloading::Error::DlSymUnknown => PluginLoadError::SymbolNotFound {
-                        symbol_name: symbol_name.to_string(),
+                        library_name: plugin_name.to_owned(),
+                        symbols_name: symbol_name.to_string(),
                     },
                     libloading::Error::DlSym { desc: _ } => PluginLoadError::SymbolNotFound {
-                        symbol_name: symbol_name.to_string(),
+                        library_name: plugin_name.to_owned(),
+                        symbols_name: symbol_name.to_string(),
                     },
                     e => PluginLoadError::SymbolLoadError {
+                        library_name: plugin_name.to_owned(),
                         symbol_name: symbol_name.to_string(),
-                        error: e,
+                        error: e.to_string(),
                     },
-                })?
+                });
+
+            match res {
+                Ok(f) => f,
+                Err(e) => return Err(PluginLoadError::SymbolLoadError {
+                    library_name: plugin_name.to_owned(),
+                    symbol_name: symbol_name.to_string(),
+                    error: e.to_string(),
+                }),
+            }
         };
 
-        let mut registrator = PluginRegistrator::new(ctx);
+        let plugin = new(ctx);
 
-        if !new(registrator.as_c_interface()) {
+        if plugin.is_null() {
             return Err(PluginLoadError::PluginInitFailed {
+                library_name: plugin_name.to_owned(),
                 symbol_name: symbol_name.to_string(),
-                error: "".to_string(),
+                error: "Plugin init failed. null ptr received".to_string(),
             });
         }
 
-        let res = registrator.get_plugins().into_iter().map(|r| ManagedPlugin {
-            plugin: r,
-            _library: library.clone(),
-        });
+        let plugin = unsafe {
+            PluginC::from_raw(plugin)
+        };
 
-        Ok(res.collect())
+        let plugin = PluginType::C {
+            lib: library,
+            plugin: plugin,
+        };
+
+        Ok(plugin)
     }
 
     /// Создает новый экземпляр ManagedPlugin, инициализируя плагин.
@@ -200,190 +173,424 @@ impl ManagedPlugin{
     /// # Returns
     /// * `Result<Self, String>` - Успешно созданный ManagedPlugin или сообщение об ошибке
     pub fn try_load_rust_plugin(
-        library: Arc<Library>,
+        plugin_name: &str,
         symbol_name: &str,
         ctx: &mut UnixContext,
-    ) -> Result<Vec<Self>, PluginLoadError> {
-        let new: Symbol<RegisterRustPluginFn<UnixContext>> = unsafe {
-            library
-                .get(b"register_rust_plugin")
-                .map_err(|e| match e {
-                    libloading::Error::DlSymUnknown => PluginLoadError::SymbolNotFound {
-                        symbol_name: symbol_name.to_string(),
-                    },
-                    libloading::Error::DlSym { desc: _ } => PluginLoadError::SymbolNotFound {
-                        symbol_name: symbol_name.to_string(),
-                    },
-                    e => PluginLoadError::SymbolLoadError {
-                        symbol_name: symbol_name.to_string(),
-                        error: e,
-                    },
-                })?
+    ) -> Result<PluginType<UnixContext, Library>, PluginLoadError> {
+        let library = match Self::try_load_library(plugin_name) {
+            Ok(lib) => lib,
+            Err(e) => return Err(e),
         };
 
-        let mut registrator = PluginRegistrator::new(ctx);
+        let new: Symbol<RustPluginFn<UnixContext>> = unsafe {
+            let res = library
+                .get(symbol_name.as_bytes())
+                .map_err(|e| match e {
+                    libloading::Error::DlSymUnknown => PluginLoadError::SymbolNotFound {
+                        library_name: plugin_name.to_owned(),
+                        symbols_name: symbol_name.to_string(),
+                    },
+                    libloading::Error::DlSym { desc: _ } => PluginLoadError::SymbolNotFound {
+                        library_name: plugin_name.to_owned(),
+                        symbols_name: symbol_name.to_string(),
+                    },
+                    e => PluginLoadError::SymbolLoadError {
+                        library_name: plugin_name.to_string(),
+                        symbol_name: symbol_name.to_string(),
+                        error: e.to_string(),
+                    },
+                });
 
-        if let Err(e) = new(&mut registrator) {
-            return Err(PluginLoadError::PluginInitFailed {
+            match res {
+                Ok(f) => f,
+                Err(e) => return Err(PluginLoadError::SymbolLoadError {
+                    library_name: plugin_name.to_owned(),
+                    symbol_name: symbol_name.to_string(),
+                    error: e.to_string(),
+                }),
+            }
+        };
+
+        match new(ctx) {
+            Err(e) => return Err(PluginLoadError::PluginInitFailed {
+                library_name: plugin_name.to_owned(),
                 symbol_name: symbol_name.to_string(),
                 error: e.to_string(),
-            });
-        }
-
-        let res = registrator.get_plugins().into_iter().map(|r| ManagedPlugin {
-            plugin: r,
-            _library: library.clone(),
-        });
-
-        Ok(res.collect())
-    }
-
-    /// Обрабатывает событие с помощью плагина
-    ///
-    /// # Arguments
-    /// * `ctx` - Контекст для обработки
-    ///
-    /// # Returns
-    /// * `i32` - Результат обработки
-    pub fn handle(&mut self, ctx: &mut UnixContext) -> i32 {
-        match &mut self.plugin {
-            PluginType::Rust(rust_plugin) => {
-                rust_plugin.handle(ctx)
-            }
-            PluginType::C(c_plugin) => {
-                unsafe {
-                    ((*(*c_plugin)).handle)(*c_plugin, ctx as *mut UnixContext)
-                }
-            }
+            }),
+            Ok(plugin) => Ok(PluginType::Rust {
+                lib: library,
+                plugin: plugin,
+            }),
         }
     }
 
-    /// Освобождает ресурсы плагина.
-    ///
-    /// # Arguments
-    /// * `ctx` - Контекст для обработки
-    ///
-    /// # Returns
-    /// * `i32` - Результат обработки
-    pub fn free(&mut self, ctx: &mut UnixContext) -> i32 {
-        match &mut self.plugin {
-            PluginType::Rust(rust_plugin) => {
-                rust_plugin.free(ctx)
-            }
-            PluginType::C(c_plugin) => {
-                unsafe {
-                    ((*(*c_plugin)).free)(*c_plugin, ctx as *mut UnixContext)
+    pub fn load_topological_plugin_config(path: &str) -> Result<Vec<PluginTopologicalConfig>, Box<dyn std::error::Error>> {
+        let content = fs::read_to_string(path)?;
+        let value: Value = content.parse()?;
+    
+        let top = value.as_table().ok_or("Top-level TOML is not a table")?;
+    
+        let mut plugin_configs = Vec::new();
+    
+        for (section, entry) in top {
+            if section == "plugins" {
+                if let Value::Table(plugin_sections) = entry {
+                    for (plugin_name, plugin_val) in plugin_sections {
+                        if let Value::Table(fields) = plugin_val {
+                            let path = fields.get("path")
+                                .and_then(|v| v.as_str())
+                                .ok_or(format!("Plugin '{}' missing valid 'path'", plugin_name))?
+                                .to_string();
+    
+                            let required = fields.get("required")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+    
+                            let depend = fields.get("depend")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_else(Vec::new);
+    
+                            plugin_configs.push(PluginTopologicalConfig {
+                                name: plugin_name.clone(),
+                                path,
+                                required,
+                                depend,
+                            });
+                        }
+                    }
                 }
             }
         }
+    
+        Ok(plugin_configs)
     }
-}
 
-// // Реализуем Deref для доступа к методам PluginInterface
-// impl Deref for ManagedPlugin {
-//     type Target = PluginType<UnixContext>;
-
-//     fn deref(&self) -> &Self::Target {
-//         unsafe { &*self.plugin }
-//     }
-// }
-
-// // Реализуем DerefMut для изменяемого доступа к методам PluginInterface
-// impl DerefMut for ManagedPlugin {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         unsafe { &mut *self.plugin }
-//     }
-// }
-
-pub struct PluginLoader {}
-
-impl PluginLoader {
-    /// Загружает плагины из конфигурационного файла
-    ///
-    /// # Arguments
-    /// * `config_path` - Путь к конфигурационному файлу
-    ///
-    /// # Returns
-    /// * `Result<Vec<ManagedPlugin>, String>` - Список загруженных плагинов или сообщение об ошибке
-    pub fn reload_plugins(
-        config_path: &str,
-        ctx: &mut UnixContext,
-    ) -> Result<Vec<ManagedPlugin>, String> {
-        // Читаем конфиг
-        let config_content = fs::read_to_string(config_path)
-            .map_err(|e| format!("Не удалось прочитать config.toml: {}", e))?;
-
-        let config: Value = config_content
-            .parse::<Value>()
-            .map_err(|e| format!("Ошибка парсинга config.toml: {}", e))?;
-
-        let plugin_section = config.get("plugins").ok_or_else(|| {
-            "Некорректный формат config.toml: отсутствует секция plugins".to_string()
-        })?;
-
-        let plugin_order = plugin_section
-            .get("order")
-            .and_then(|o| o.as_array())
-            .ok_or_else(|| {
-                "Некорректный формат config.toml: отсутствует массив plugins.order".to_string()
-            })?;
-
-        if plugin_order.is_empty() {
-            return Err("В конфиге не указаны плагины".to_string());
+    // Функция для получения хеш-суммы файла или времени модификации
+    pub fn get_file_signature(path: &str) -> Option<String> {
+        // Вариант 1: Использовать время модификации файла (проще и быстрее)
+        if let Ok(metadata) = fs::metadata(path) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(duration) = modified.duration_since(SystemTime::UNIX_EPOCH) {
+                    return Some(duration.as_secs().to_string());
+                }
+            }
         }
-
-        let mut plugins = Vec::new();
-        let mut load_errors = Vec::new();
-
-        for plugin_value in plugin_order {
-            // Поддержка как простых строк, так и объектов с настройками
-            let (plugin_name, required) = match plugin_value {
-                Value::String(name) => (name.as_str(), true), // По умолчанию обязательный
-                Value::Table(table) => {
-                    let name = table.get("name").and_then(|n| n.as_str()).ok_or_else(|| {
-                        "Имя плагина должно быть указано в поле 'name'".to_string()
-                    })?;
-
-                    let required = table
-                        .get("required")
-                        .and_then(|r| r.as_bool())
-                        .unwrap_or(true); // По умолчанию обязательный
-
-                    (name, required)
-                }
-                _ => {
-                    return Err(
-                        "Элемент массива plugins.order должен быть строкой или таблицей"
-                            .to_string(),
-                    )
-                }
+        
+        // Вариант 2: Вычислить SHA-256 хеш файла (более надежно, но медленнее)
+        // Раскомментируйте, если нужна более точная проверка изменений
+        /*
+        use sha2::{Sha256, Digest};
+        
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return None,
+        };
+        
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; 1024];
+        
+        loop {
+            let bytes_read = match file.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => n,
+                Err(_) => return None,
             };
+            
+            hasher.update(&buffer[..bytes_read]);
+        }
+        
+        let hash = hasher.finalize();
+        Some(format!("{:x}", hash))
+        */
+        
+        None
+    }
 
-            match ManagedPlugin::try_load_plugin(plugin_name, ctx) {
-                Ok(managed_plugin) => {
-                    plugins.extend(managed_plugin);
-                }
-                Err(e) => {
-                    if required {
-                        return Err(format!(
-                            "Не удалось загрузить обязательный плагин {}: {}",
-                            plugin_name, e
-                        ));
-                    } else {
-                        load_errors.push(format!(
-                            "Пропуск необязательного плагина {}: {}",
-                            plugin_name, e
-                        ));
+    // Обновленная функция загрузки конфигурации
+    pub fn load_ordered_plugin_config(path: &str) -> Result<Vec<PluginOrderedConfig>, PluginConfigError> {
+        let content = fs::read_to_string(path).map_err(|op| PluginConfigError::ReadFileError { error: op.to_string() })?;
+
+        let value = content.parse::<Value>().map_err(|op| PluginConfigError::ParsingError { error: op.to_string() })?;
+    
+        let top = value.as_table().ok_or(PluginConfigError::ParsingError {
+            error: "Top-level TOML is not a table".to_string()
+        })?;
+    
+        let mut plugin_configs = Vec::new();
+        let required_plugins = ["poll", "logger"];
+    
+        let mut i = 0;
+        for (section, entry) in top {
+            if section == "plugins" {
+                if let Value::Table(plugin_sections) = entry {
+                    for (plugin_name, plugin_val) in plugin_sections {
+                        if let Value::Table(fields) = plugin_val {
+                            let enable = fields.get("enable")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true);
+
+                            let path = fields.get("path")
+                                .and_then(|v| v.as_str())
+                                .ok_or(PluginConfigError::PluginParsingError {
+                                    plugin_name: plugin_name.clone(),
+                                    error: format!("missing valid 'path'"),
+                                })?
+                                .to_string();
+
+                            let order = fields.get("order")
+                                .and_then(|v| v.as_integer())
+                                .unwrap_or(i);
+
+                            let reload = fields.get("reload")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            
+                            i = order + 1;
+                            
+                            // Получаем хеш-сумму или время модификации файла
+                            let file_hash = Self::get_file_signature(&path);
+    
+                            plugin_configs.push(PluginOrderedConfig {
+                                enable,
+                                system: false,
+                                name: plugin_name.clone(),
+                                path,
+                                order,
+                                reload,
+                                file_hash,
+                            });
+                        }
                     }
                 }
             }
         }
 
-        // Можно логировать ошибки загрузки необязательных плагинов
-        for error in &load_errors {
-            warn!(ctx, "{}", error);
+        // ❗ Сравнение: какие required_plugins отсутствуют среди включённых плагинов
+        let missing_plugins: Vec<String> = required_plugins
+            .iter()
+            .filter(|name| {
+                !plugin_configs.iter().any(|p| p.name == **name && p.enable)
+            })
+            .map(|s| s.to_string())
+            .collect();
+
+        if !missing_plugins.is_empty() {
+            return Err(PluginConfigError::PluginMissingError {
+                plugins: missing_plugins,
+            });
         }
 
-        Ok(plugins)
+        for plugin_config in plugin_configs.iter_mut() {
+            if required_plugins.contains(&plugin_config.name.as_str()) {
+                plugin_config.enable = true;
+                plugin_config.system = true;
+            }
+        }
+    
+        Ok(plugin_configs)
+    }
+
+    // Вспомогательная функция для проверки, изменился ли файл плагина
+    fn file_changed(old_config: &PluginOrderedConfig, new_config: &PluginOrderedConfig) -> bool {
+        // Если у нас нет хеш-суммы для старого или нового файла, считаем что файл изменился
+        if old_config.file_hash.is_none() || new_config.file_hash.is_none() {
+            return true;
+        }
+        
+        // Сравниваем хеш-суммы
+        old_config.file_hash != new_config.file_hash
+    }
+
+    // Обновленная функция анализа изменений
+    pub fn analyze_config_changes(
+        current_plugins: &[Plugin<UnixContext, Library>],
+        new_configs: &[PluginOrderedConfig]
+    ) -> Vec<PluginConfigChange> {
+        let mut changes = Vec::new();
+        
+        // Создаем хэш-мапу текущих плагинов для быстрого поиска
+        let mut current_map = HashMap::new();
+        for plugin in current_plugins {
+            current_map.insert(plugin.config.name.clone(), (plugin.config.clone(), &plugin.status));
+        }
+        
+        // Создаем хэш-сет новых плагинов для быстрой проверки
+        let new_names: std::collections::HashSet<String> = new_configs
+            .iter()
+            .map(|config| config.name.clone())
+            .collect();
+        
+        // Проверяем новые конфиги
+        for new_config in new_configs {
+            if let Some((current_config, plugin_status)) = current_map.get(&new_config.name) {
+                // Плагин уже существует
+                if !new_config.enable {
+                    // Плагин нужно отключить
+                    changes.push(PluginConfigChange::Disable(new_config.name.clone()));
+                } else if new_config.reload {
+                    // Плагин нужно перезагрузить по требованию конфига
+                    changes.push(PluginConfigChange::Reload(new_config.clone()));
+                } else if current_config.path != new_config.path || 
+                          current_config.order != new_config.order {
+                    // Изменились важные параметры - перезагружаем
+                    changes.push(PluginConfigChange::Reload(new_config.clone()));
+                } else if Self::file_changed(current_config, new_config) {
+                    // Файл библиотеки изменился - перезагружаем
+                    changes.push(PluginConfigChange::Reload(new_config.clone()));
+                } else if !matches!(plugin_status, abstractions::PluginStatus::Enable(_)) && new_config.enable {
+                    // Плагин отключен, но должен быть включен
+                    changes.push(PluginConfigChange::Enable(new_config.clone()));
+                } else {
+                    // Нет изменений
+                    changes.push(PluginConfigChange::NoChange(new_config.name.clone()));
+                }
+            } else if new_config.enable {
+                // Новый плагин, который нужно добавить
+                changes.push(PluginConfigChange::Add(new_config.clone()));
+            }
+        }
+        
+        // Проверяем удаленные плагины
+        for plugin in current_plugins {
+            if !new_names.contains(&plugin.config.name) {
+                // Плагин был удален из конфигурации
+                changes.push(PluginConfigChange::Remove(plugin.config.name.to_string()));
+            }
+        }
+        
+        changes
+    }
+    
+    // Метод для применения изменений конфигурации
+    pub fn apply_config_changes(
+        plugin_manager: &mut PluginManager<UnixContext, Library>,
+        ctx: &mut UnixContext,
+        changes: Vec<PluginConfigChange>,
+    ) -> Result<(), PluginLoadError> {
+        for change in changes {
+            match change {
+                PluginConfigChange::Add(config) => {
+                    // Загружаем новый плагин
+                    match Self::try_load_plugin(&config.path, ctx) {
+                        Ok(plugin_type) => {
+                            plugin_manager.get_plugins().push(abstractions::Plugin {
+                                config: config.clone(),
+                                status: abstractions::PluginStatus::Enable(plugin_type),
+                            });
+                        },
+                        Err(err) => {
+                            plugin_manager.get_plugins().push(abstractions::Plugin {
+                                config: config.clone(),
+                                status: abstractions::PluginStatus::LoadingFailed {
+                                    library_name: config.path.clone(),
+                                    error: err.to_string(),
+                                },
+                            });
+                            if config.system {
+                                return Err(err);
+                            } else {
+                                warn!(ctx, "Failed to load plugin {}: {}", config.name, err);
+                            }
+                        }
+                    }
+                },
+                PluginConfigChange::Reload(config) => {
+                    // Находим и удаляем старый плагин
+                    if let Some(idx) = plugin_manager.get_plugins().iter().position(|p| p.config.name == config.name) {
+                        // забераем плагин из списка
+                        let plugin = plugin_manager.get_plugins().remove(idx);
+                        // Вызываем free для плагина перед удалением
+                        if let abstractions::PluginStatus::Enable(plugin_type) = plugin.status {
+                            match plugin_type {
+                                abstractions::PluginType::Rust {mut plugin, .. } => {
+                                    plugin.free(ctx);
+                                },
+                                abstractions::PluginType::C { plugin, .. } => {
+                                    unsafe {
+                                        (plugin.free)(plugin.get_raw(), ctx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Загружаем плагин заново
+                    match Self::try_load_plugin(&config.path, ctx) {
+                        Ok(plugin_type) => {
+                            plugin_manager.get_plugins().push(abstractions::Plugin {
+                                config: config,
+                                status: abstractions::PluginStatus::Enable(plugin_type),
+                            });
+                        },
+                        Err(err) => {
+                            plugin_manager.get_plugins().push(abstractions::Plugin {
+                                config: config.clone(),
+                                status: abstractions::PluginStatus::LoadingFailed {
+                                    library_name: config.path.clone(),
+                                    error: err.to_string(),
+                                },
+                            });
+                            if config.system {
+                                return Err(err);
+                            } else {
+                                warn!(ctx, "Failed to load plugin {}: {}", config.name, err);
+                            }
+                        }
+                    }
+                },
+                PluginConfigChange::Remove(name) => {
+                    // Находим и удаляем плагин
+                    if let Some(idx) = plugin_manager.get_plugins().iter().position(|p| p.config.name == name) {
+                        let plugin = plugin_manager.get_plugins().remove(idx);
+                        // Вызываем free для плагина перед удалением
+                        if let abstractions::PluginStatus::Enable(plugin_type) = plugin.status {
+                            match plugin_type {
+                                abstractions::PluginType::Rust {mut plugin, .. } => {
+                                    plugin.free(ctx);
+                                },
+                                abstractions::PluginType::C { plugin, .. } => {
+                                    unsafe {
+                                        (plugin.free)(plugin.get_raw(), ctx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                PluginConfigChange::Disable(name) => {
+                    // Находим и отключаем плагин
+                    if let Some(idx) = plugin_manager.get_plugins().iter().position(|p| p.config.name == name) {
+                        let plugin = &mut plugin_manager.get_plugins()[idx];
+                        if let abstractions::PluginStatus::Enable(plugin_type) = std::mem::replace(&mut plugin.status, abstractions::PluginStatus::Unloaded) {
+                            plugin.status = abstractions::PluginStatus::Disable(plugin_type);
+                        }
+                    }
+                },
+                PluginConfigChange::Enable(config) => {
+                    // Находим и включаем плагин
+                    if let Some(idx) = plugin_manager.get_plugins().iter().position(|p| p.config.name == config.name) {
+                        let plugin = &mut plugin_manager.get_plugins()[idx];
+                        if let abstractions::PluginStatus::Disable(plugin_type) = std::mem::replace(&mut plugin.status, abstractions::PluginStatus::Unloaded) {
+                            plugin.status = abstractions::PluginStatus::Enable(plugin_type);
+                            // Обновляем конфиг
+                            plugin.config = config;
+                        }
+                    }
+                },
+                PluginConfigChange::NoChange(_) => {
+                    // Ничего не делаем
+                }
+            }
+        }
+        
+        // Пересортировать плагины по порядку
+        plugin_manager.get_plugins().sort_by_key(|p| p.config.order);
+        
+        Ok(())
     }
 }
