@@ -1,5 +1,5 @@
 use nix::poll::PollFlags;
-use std::ffi::CString;
+use std::{ffi::CString, sync::Arc};
 use std::os::raw::c_int;
 use std::os::unix::io::RawFd;
 use nix::libc;
@@ -14,8 +14,8 @@ use common::UnixContext;
 const IN_MODIFY: u32 = 0x00000002;
 const IN_CLOSE_WRITE: u32 = 0x00000008;
 const IN_MOVED_TO: u32 = 0x00000080;
-const IN_CREATE: u32 = 0x00000100;
-const IN_DELETE: u32 = 0x00000200;
+// const IN_CREATE: u32 = 0x00000100;
+// const IN_DELETE: u32 = 0x00000200;
 
 // Структура для событий inotify
 #[repr(C)]
@@ -56,10 +56,10 @@ enum EditPattern {
     None,
     // Паттерн 1: Редактирование "на месте"
     ModifyStarted,
-    // Паттерн 2: Создание временного файла и переименование
-    TempFileCreated,
-    // Паттерн 3: Удаление и создание нового файла
-    FileDeleted,
+    // // Паттерн 2: Создание временного файла и переименование
+    // TempFileCreated,
+    // // Паттерн 3: Удаление и создание нового файла
+    // FileDeleted,
     // Завершенное состояние
     Completed,
 }
@@ -69,16 +69,17 @@ enum EditPattern {
 pub struct ConfigWatcherPlugin {
     inotify_fd: RawFd,
     watch_descriptor: i32,
-    config_path: String,
+    // config_path: String,
     buf: Buffer,
     error_count: usize,
     max_errors: usize,
     edit_pattern: EditPattern,
-    last_cookie: u32,  // Для отслеживания связанных событий
+    // last_cookie: u32,  // Для отслеживания связанных событий
+    ctx: Arc<UnixContext>,
 }
 
 impl ConfigWatcherPlugin {
-    pub fn new(ctx: &mut UnixContext) -> Result<Self, String> {
+    pub fn new(ctx: Arc<UnixContext>) -> Result<Self, String> {
         info!(ctx, "config_watcher: plugin initializing");
         
         // Путь к файлу конфигурации
@@ -129,46 +130,56 @@ impl ConfigWatcherPlugin {
         Ok(ConfigWatcherPlugin {
             inotify_fd,
             watch_descriptor,
-            config_path,
+            // config_path,
             buf,
             error_count: 0,
             max_errors: 5,
             edit_pattern: EditPattern::None,
-            last_cookie: 0,
+            // last_cookie: 0,
+            ctx,
         })
     }
     
     // Обработка событий с детальной обработкой ошибок
-    fn handle_events(&mut self, ctx: &mut UnixContext) -> Result<(), PluginError> {
+    fn handle_events(&mut self) -> Result<(), PluginError> {
         // Проверяем, есть ли события на нашем файловом дескрипторе
         let mut should_process_events = false;
         
-        if let Some(fd) = ctx.poll.get_fd_mut(self.inotify_fd) {
-            if fd.revents > 0 {
-                if PollFlags::from_bits(fd.revents).is_none() {
+        // Проверяем, есть ли наш файловый дескриптор в poll
+        if !self.ctx.poll.has_fd(self.inotify_fd) {
+            return Err(PluginError::Fatal(format!(
+                "Inotify fd {} not found in poll",
+                self.inotify_fd
+            )));
+        }
+        
+        // Получаем revents для нашего fd
+        if let Some(revents) = self.ctx.poll.get_revents(self.inotify_fd) {
+            if revents > 0 {
+                if PollFlags::from_bits(revents).is_none() {
                     return Err(PluginError::ReadError(format!(
                         "Unknown revents: {} on inotify fd {}",
-                        fd.revents,
+                        revents,
                         self.inotify_fd
                     )));
                 }
                 
-                let revents = PollFlags::from_bits(fd.revents).unwrap();
+                let revents_flags = PollFlags::from_bits(revents).unwrap();
                 
                 // Обрабатываем ошибки файлового дескриптора
-                if revents.contains(PollFlags::POLLERR) {
+                if revents_flags.contains(PollFlags::POLLERR) {
                     return Err(PluginError::Fatal(format!(
                         "POLLERR on inotify fd {}",
                         self.inotify_fd
                     )));
                 }
-                if revents.contains(PollFlags::POLLNVAL) {
+                if revents_flags.contains(PollFlags::POLLNVAL) {
                     return Err(PluginError::Fatal(format!(
                         "POLLNVAL on inotify fd {}",
                         self.inotify_fd
                     )));
                 }
-                if revents.contains(PollFlags::POLLHUP) {
+                if revents_flags.contains(PollFlags::POLLHUP) {
                     return Err(PluginError::Fatal(format!(
                         "POLLHUP on inotify fd {}",
                         self.inotify_fd
@@ -176,7 +187,7 @@ impl ConfigWatcherPlugin {
                 }
                 
                 // Обрабатываем данные, если они доступны
-                if revents.contains(PollFlags::POLLIN) {
+                if revents_flags.contains(PollFlags::POLLIN) {
                     // Пытаемся прочитать данные
                     match read_fd(self.inotify_fd, &mut self.buf) {
                         ReadResult::Success(_) => {
@@ -214,22 +225,18 @@ impl ConfigWatcherPlugin {
                         }
                     }
                 }
+                
+                // Сбрасываем revents после обработки
+                self.ctx.poll.reset_revents(self.inotify_fd);
             }
-            fd.revents = 0;
-        } else {
-            // Файловый дескриптор не найден в poll
-            return Err(PluginError::Fatal(format!(
-                "Inotify fd {} not found in poll",
-                self.inotify_fd
-            )));
         }
         
         // Обрабатываем события после того, как закончили работу с fd
         if should_process_events {
-            if self.process_events(ctx) {
+            if self.process_events() {
                 // Если обнаружен завершенный паттерн редактирования, устанавливаем флаг перезагрузки
-                info!(ctx, "Config file change pattern detected, triggering reload");
-                ctx.reload_config = true;
+                info!(self.ctx, "Config file change pattern detected, triggering reload");
+                self.ctx.reload_config.set_reload_needed();
                 self.edit_pattern = EditPattern::None; // Сбрасываем паттерн
             }
             self.buf.clear();
@@ -240,7 +247,7 @@ impl ConfigWatcherPlugin {
     
     // Обработка событий inotify
     // Возвращает true, если обнаружен завершенный паттерн редактирования
-    fn process_events(&mut self, ctx: &mut UnixContext) -> bool {
+    fn process_events(&mut self) -> bool {
         let data = self.buf.as_data_slice();
         let mut offset = 0;
         
@@ -265,7 +272,7 @@ impl ConfigWatcherPlugin {
             
             // Проверяем, что событие относится к нашему watch descriptor
             if event.wd == self.watch_descriptor {
-                trace!(ctx, "Config file event: mask={:x}, cookie={}", 
+                trace!(self.ctx, "Config file event: mask={:x}, cookie={}", 
                       event.mask, event.cookie);
                 
                 // Обновляем состояние паттерна в зависимости от типа события
@@ -275,7 +282,7 @@ impl ConfigWatcherPlugin {
                         if (event.mask & IN_MODIFY) != 0 {
                             // Паттерн 1: Начало модификации "на месте"
                             self.edit_pattern = EditPattern::ModifyStarted;
-                            trace!(ctx, "Pattern 1 started: IN_MODIFY");
+                            trace!(self.ctx, "Pattern 1 started: IN_MODIFY");
                         }
                     },
                     EditPattern::ModifyStarted => {
@@ -284,15 +291,12 @@ impl ConfigWatcherPlugin {
                             // Паттерн 1 завершен: Модификация + Закрытие
                             self.edit_pattern = EditPattern::Completed;
                             pattern_completed = true;
-                            trace!(ctx, "Pattern 1 completed: IN_MODIFY + IN_CLOSE_WRITE");
+                            trace!(self.ctx, "Pattern 1 completed: IN_MODIFY + IN_CLOSE_WRITE");
                         }
                     },
                     EditPattern::Completed => {
                         // Уже завершено, ничего не делаем
                     },
-                    _ => {
-                        // Другие состояния не используются при отслеживании только файла
-                    }
                 }
                 
                 // Проверка для одиночных событий, которые могут указывать на изменение
@@ -300,7 +304,7 @@ impl ConfigWatcherPlugin {
                     // Файл был изменен и закрыт без предварительного IN_MODIFY
                     self.edit_pattern = EditPattern::Completed;
                     pattern_completed = true;
-                    trace!(ctx, "Direct write detected: IN_CLOSE_WRITE");
+                    trace!(self.ctx, "Direct write detected: IN_CLOSE_WRITE");
                 }
             }
             
@@ -312,8 +316,16 @@ impl ConfigWatcherPlugin {
     }
 }
 
+
 impl Drop for ConfigWatcherPlugin {
     fn drop(&mut self) {
+        info!(self.ctx, "config_watcher: plugin cleaning up");
+        
+        // Удаляем файловый дескриптор из poll
+        if !self.ctx.poll.remove_fd(self.inotify_fd) {
+            error!(self.ctx, "Failed to remove inotify fd {} from poll", self.inotify_fd);
+        }
+        
         // Удаляем watch
         let res = unsafe {
             libc::inotify_rm_watch(self.inotify_fd, self.watch_descriptor)
@@ -334,30 +346,21 @@ impl Drop for ConfigWatcherPlugin {
     }
 }
 impl PluginRust<UnixContext> for ConfigWatcherPlugin {
-    fn free(&mut self, ctx: &mut UnixContext) -> c_int {
-        info!(ctx, "config_watcher: plugin cleaning up");
-        
-        // Удаляем файловый дескриптор из poll
-        if !ctx.poll.remove_fd(self.inotify_fd) {
-            error!(ctx, "Failed to remove inotify fd {} from poll", self.inotify_fd);
-        }
-        
-        0 // 0 означает успешное освобождение
-    }
-    
-    fn handle(&mut self, ctx: &mut UnixContext) -> c_int {
-        if ctx.shutdown.is_stoping() {
+    fn handle(&mut self) -> c_int {
+        if self.ctx.shutdown.is_stoping() {
             return ShutdownType::Stoped.to_int();
         }
         
-        if ctx.poll.get_result() == 0 {
+        if self.ctx.poll.get_result() == 0 {
             return 0;
         }
         
         // Обрабатываем события и возвращаем результат
-        match self.handle_events(ctx) {
+        match self.handle_events() {
             Ok(_) => {
                 // Успешная обработка, сбрасываем счетчик ошибок
+                // Примечание: теперь error_count должен быть атомарным или защищенным мьютексом
+                // для потокобезопасности, но для простоты оставим как есть
                 self.error_count = 0;
                 0 // Успешное выполнение
             },
@@ -367,12 +370,12 @@ impl PluginRust<UnixContext> for ConfigWatcherPlugin {
                 
                 // Если превышен лимит ошибок, возвращаем код ошибки
                 if self.error_count > self.max_errors {
-                    error!(ctx, "Too many errors ({}) in config_watcher plugin, shutting down", self.error_count);
+                    error!(self.ctx, "Too many errors ({}) in config_watcher plugin, shutting down", self.error_count);
                     return 1; // Код ошибки, который приведет к удалению плагина
                 }
                 
                 // Логируем ошибку
-                error!(ctx, "Error in config_watcher plugin: {}", err);
+                error!(self.ctx, "Error in config_watcher plugin: {}", err);
                 
                 // Возвращаем код в зависимости от типа ошибки
                 err.to_return_code()
@@ -382,7 +385,7 @@ impl PluginRust<UnixContext> for ConfigWatcherPlugin {
 }
 
 #[no_mangle]
-pub extern "Rust" fn register_rust_plugin(ctx: &mut UnixContext) -> Result<Box<dyn PluginRust<UnixContext>>, String> {
+pub extern "Rust" fn register_rust_plugin(ctx: Arc<UnixContext>) -> Result<Box<dyn PluginRust<UnixContext>>, String> {
     let plugin = ConfigWatcherPlugin::new(ctx)?;
     let plugin = Box::new(plugin);
     

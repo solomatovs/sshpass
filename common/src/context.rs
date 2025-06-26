@@ -19,18 +19,21 @@
 // use nix::sys::termios::{self, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios};
 // use nix::sys::timer::{Expiration, TimerSetTimeFlags};
 // use nix::sys::timerfd::{ClockId, TimerFd, TimerFlags};
-
-
-use abstractions::{AppShutdown, LogBufferStack, UnixPoll, AppContext};
+use abstractions::{AppShutdown, LogBufferStack, UnixPoll, AppContext, ReloadConfig};
 // use crate::plugins_info::PluginsInfo;
 
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnixContext {
+    // Для poll используем Mutex, так как операции чтения и записи связаны
     pub poll: UnixPoll,
+    // Для shutdown используем RwLock, так как операции чтения и записи не связаны
     pub shutdown: AppShutdown,
+    
+    // Для логов используем Mutex, так как операции атомарны
     pub log_buffer: LogBufferStack,
-    pub reload_config: bool,
+    
+    // Для простого флага используем AtomicBool
+    pub reload_config: ReloadConfig,
 }
 
 impl UnixContext {
@@ -39,9 +42,8 @@ impl UnixContext {
         Self {
             poll: UnixPoll::new(poll_timeout),
             shutdown: AppShutdown::default(),
-            // стековая очередь сообщений логов
             log_buffer: LogBufferStack::new(),
-            reload_config: false,
+            reload_config: ReloadConfig::new(),
         }
     }
 }

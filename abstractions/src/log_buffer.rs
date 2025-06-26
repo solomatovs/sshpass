@@ -1,7 +1,6 @@
-
 use std::{fmt::Debug, str};
 use std::os::raw::c_char;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use nix::sys::eventfd::EventFd;
 use nix::libc::{gettimeofday, localtime_r, strftime, timeval, suseconds_t, tm};
 
@@ -24,6 +23,10 @@ pub enum LogError {
     /// Ошибка вызова `gettimeofday` — не удалось получить текущее время.
     #[error("Failed to get current time using gettimeofday()")]
     GetTimeOfDayError,
+    
+    /// Ошибка блокировки мьютекса
+    #[error("Failed to lock mutex: {0}")]
+    MutexLockError(String),
 }
 
 /// Уровни логирования
@@ -52,7 +55,7 @@ impl LogLevel {
 }
 
 /// Запись в лог
-#[derive(Debug)]
+#[derive(Debug, Clone)]  // Добавляем Clone для возможности копирования
 #[repr(C)]
 pub struct LogEntryStack {
     timestamp: Option<timeval>,
@@ -224,62 +227,106 @@ impl LogEntryStack {
     }
 }
 
-#[derive(Debug)]
-pub struct LogBufferStack {
+// Внутренняя структура для хранения данных LogBufferStack
+#[derive(Debug, Clone)]
+struct LogBufferStackInner {
     inner: Queue<LogEntryStack, LOG_QUEUE_MAX_LEN>,
     event_fd: Option<Arc<EventFd>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogBufferStack {
+    // Используем Mutex для защиты внутреннего состояния
+    inner: Arc<Mutex<LogBufferStackInner>>,
 }
 
 impl LogBufferStack {
     pub fn new() -> Self {
         Self {
-            event_fd: None,
-            inner: Queue::new(),
+            inner: Arc::new(Mutex::new(LogBufferStackInner {
+                inner: Queue::new(),
+                event_fd: None,
+            })),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn peek(&self) -> Option<&LogEntryStack> {
-        self.inner.peek()
-    }
-
-    pub fn dequeue(&mut self) -> Option<LogEntryStack> {
-        self.inner.dequeue()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn enqueue_or_drop(&mut self, entry: LogEntryStack) {
-        if let Err(entry) = self.inner.enqueue(entry) {
-            // Удалить старейший элемент
-            let _ = self.inner.dequeue();
-            // Повторно добавить (гарантированно влезет)
-            let _ = self.inner.enqueue(entry);
-        }
-
-        self.notify_event_fd();
-    }
-
-    fn notify_event_fd(&mut self) {
-        if let Some(event_fd) = &self.event_fd {
-            // Используем безопасный метод write из EventFd
-            if let Err(_) = event_fd.write(1) {
-                // Ошибки можно игнорировать, так как это просто уведомление
-                // Если нужно, можно добавить логирование
+        match self.inner.lock() {
+            Ok(inner) => inner.inner.len(),
+            Err(e) => {
+                eprintln!("Failed to lock log buffer: {}", e);
+                0
             }
         }
     }
 
-    pub fn set_notify_event_fd(&mut self, event_fd: Option<Arc<EventFd>>) {
-        self.event_fd = event_fd;
+    pub fn peek(&self) -> Option<LogEntryStack> {
+        match self.inner.lock() {
+            Ok(inner) => inner.inner.peek().cloned(),
+            Err(e) => {
+                eprintln!("Failed to lock log buffer: {}", e);
+                None
+            }
+        }
     }
 
-    pub fn log(&mut self, level: LogLevel, msg: &str) -> Result<(), LogError> {
+    pub fn dequeue(&self) -> Option<LogEntryStack> {
+        match self.inner.lock() {
+            Ok(mut inner) => inner.inner.dequeue(),
+            Err(e) => {
+                eprintln!("Failed to lock log buffer: {}", e);
+                None
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self.inner.lock() {
+            Ok(inner) => inner.inner.is_empty(),
+            Err(e) => {
+                eprintln!("Failed to lock log buffer: {}", e);
+                true
+            }
+        }
+    }
+
+    pub fn enqueue_or_drop(&self, entry: LogEntryStack) -> Result<(), LogError> {
+        let mut inner = self.inner.lock()
+            .map_err(|e| LogError::MutexLockError(e.to_string()))?;
+        
+        if let Err(entry) = inner.inner.enqueue(entry) {
+            // Удалить старейший элемент
+            let _ = inner.inner.dequeue();
+            // Повторно добавить (гарантированно влезет)
+            let _ = inner.inner.enqueue(entry);
+        }
+
+        Self::notify_event_fd(inner)?;
+        
+        Ok(())
+    }
+
+    fn notify_event_fd(inner: MutexGuard<'_, LogBufferStackInner>) -> Result<(), LogError> {
+        if let Some(event_fd) = &inner.event_fd {
+            // Используем безопасный метод write из EventFd
+            if let Err(e) = event_fd.write(1) {
+                eprintln!("Failed to write to event_fd: {}", e);
+            }
+        }
+        
+        Ok(())
+    }
+
+    pub fn set_notify_event_fd(&self, event_fd: Option<Arc<EventFd>>) -> Result<(), LogError> {
+        let mut inner = self.inner.lock()
+            .map_err(|e| LogError::MutexLockError(e.to_string()))?;
+            
+        inner.event_fd = event_fd;
+        
+        Ok(())
+    }
+
+    pub fn log(&self, level: LogLevel, msg: &str) -> Result<(), LogError> {
         let mut timestamp = Some(LogEntryStack::get_timestamp()?);
         let mut level = Some(level);
         let bytes = msg.as_bytes();
@@ -305,18 +352,18 @@ impl LogBufferStack {
                 buffer[..chunk_len].copy_from_slice(chunk);
                 buffer[chunk_len] = b'\n';
                 let entry = LogEntryStack::new_with_timeval(timestamp, level, &buffer[..chunk_len + 1]);
-                self.enqueue_or_drop(entry);
+                self.enqueue_or_drop(entry)?;
             // Если это не последний кусок, то добавляем перенос строки
             } else if is_last_chunk && chunk_len == LOG_MESSAGE_MAX_LEN {
                 let entry = LogEntryStack::new_with_timeval(timestamp, level, chunk);
-                self.enqueue_or_drop(entry);
+                self.enqueue_or_drop(entry)?;
     
                 let entry = LogEntryStack::new_with_timeval(timestamp, level, b"\n");
-                self.enqueue_or_drop(entry);
+                self.enqueue_or_drop(entry)?;
             // Если это не последний кусок, то добавляем перенос строки
             } else {
                 let entry = LogEntryStack::new_with_timeval(timestamp, level, chunk);
-                self.enqueue_or_drop(entry);
+                self.enqueue_or_drop(entry)?;
             }
     
             offset += chunk_len;
@@ -325,28 +372,65 @@ impl LogBufferStack {
         Ok(())
     }
 
-    pub fn trace(&mut self, msg: &str) -> Result<(), LogError> {
+    pub fn trace(&self, msg: &str) -> Result<(), LogError> {
         self.log(LogLevel::Trace, msg)
     }
 
-    pub fn debug(&mut self, msg: &str) -> Result<(), LogError> {
+    pub fn debug(&self, msg: &str) -> Result<(), LogError> {
         self.log(LogLevel::Debug, msg)
     }
-
-    pub fn info(&mut self, msg: &str) -> Result<(), LogError> {
+    pub fn info(&self, msg: &str) -> Result<(), LogError> {
         self.log(LogLevel::Info, msg)
     }
 
-    pub fn warn(&mut self, msg: &str) -> Result<(), LogError> {
+    pub fn warn(&self, msg: &str) -> Result<(), LogError> {
         self.log(LogLevel::Warning, msg)
     }
 
-    pub fn error(&mut self, msg: &str) -> Result<(), LogError> {
+    pub fn error(&self, msg: &str) -> Result<(), LogError> {
         self.log(LogLevel::Error, msg)
     }
 
-    pub fn critical(&mut self, msg: &str) -> Result<(), LogError> {
+    pub fn critical(&self, msg: &str) -> Result<(), LogError> {
         self.log(LogLevel::Critical, msg)
+    }
+    
+    // Новый метод для получения всех сообщений из буфера
+    pub fn get_all_entries(&self) -> Vec<LogEntryStack> {
+        match self.inner.lock() {
+            Ok(inner) => {
+                let mut entries = Vec::with_capacity(inner.inner.len());
+                for i in 0..inner.inner.len() {
+                    if let Some(entry) = inner.inner.iter().nth(i) {
+                        entries.push(entry.clone());
+                    }
+                }
+                entries
+            },
+            Err(e) => {
+                eprintln!("Failed to lock log buffer: {}", e);
+                Vec::new()
+            }
+        }
+    }
+    
+    // Новый метод для получения всех отформатированных сообщений
+    pub fn get_all_formatted(&self) -> Vec<String> {
+        let entries = self.get_all_entries();
+        entries.iter().map(|entry| {
+            let (buf, len) = entry.message_format();
+            String::from_utf8_lossy(&buf[..len]).to_string()
+        }).collect()
+    }
+    
+    // Новый метод для очистки буфера
+    pub fn clear(&self) -> Result<(), LogError> {
+        let mut inner = self.inner.lock()
+            .map_err(|e| LogError::MutexLockError(e.to_string()))?;
+            
+        while inner.inner.dequeue().is_some() {}
+        
+        Ok(())
     }
 }
 

@@ -1,6 +1,8 @@
 use nix::libc;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// C-совместимая структура для работы с poll
 #[derive(Debug)]
@@ -12,60 +14,57 @@ pub struct UnixPollRaw {
     pub result: i32,
 }
 
-/// Rust-обертка для удобной работы с UnixPoll
+// Структура для хранения состояния файловых дескрипторов
+// Эта структура будет защищена Mutex
 #[derive(Debug)]
-pub struct UnixPoll {
-    raw: UnixPollRaw,
+struct FdsState {
     fds: Vec<libc::pollfd>,
-    // Добавляем HashMap для быстрого поиска по fd
     fds_map: HashMap<RawFd, usize>,
+}
+
+/// Rust-обертка для удобной работы с UnixPoll, адаптированная для многопоточности
+#[derive(Debug, Clone)]
+pub struct UnixPoll {
+    // Состояние файловых дескрипторов защищено Mutex
+    state: Arc<Mutex<FdsState>>,
+    // Таймаут может быть изменен отдельно, используем RwLock для оптимизации чтения
+    timeout: Arc<RwLock<i32>>,
+    // Результат poll может быть изменен отдельно, используем AtomicI32
+    result: Arc<AtomicI32>,
 }
 
 impl UnixPoll {
     /// Создает новый экземпляр UnixPoll
     pub fn new(timeout: i32) -> Self {
-        let mut fds = Vec::new();
-        let raw = UnixPollRaw {
-            timeout,
-            result: 0,
-            fds_ptr: fds.as_mut_ptr(),
-            fds_len: 0,
-            // fds_buffer_ptr: std::ptr::null_mut(),
-        };
-
-        UnixPoll {
-            raw,
-            fds,
-            fds_map: HashMap::new(),
+        Self {
+            state: Arc::new(Mutex::new(FdsState {
+                fds: Vec::new(),
+                fds_map: HashMap::new(),
+            })),
+            timeout: Arc::new(RwLock::new(timeout)),
+            result: Arc::new(AtomicI32::new(0)),
         }
     }
 
     /// Создает UnixPoll с предварительно выделенной емкостью для fds
     pub fn with_capacity(timeout: i32, capacity: usize) -> Self {
-        let mut fds = Vec::with_capacity(capacity);
-        let raw = UnixPollRaw {
-            fds_ptr: fds.as_mut_ptr(),
-            fds_len: 0,
-            timeout,
-            result: 0,
-        };
-
-        UnixPoll {
-            raw,
-            fds,
-            fds_map: HashMap::with_capacity(capacity),
+        Self {
+            state: Arc::new(Mutex::new(FdsState {
+                fds: Vec::with_capacity(capacity),
+                fds_map: HashMap::with_capacity(capacity),
+            })),
+            timeout: Arc::new(RwLock::new(timeout)),
+            result: Arc::new(AtomicI32::new(0)),
         }
     }
 
-    /// Добавляет новый файловый дескриптор в массив fds с буферами указанного размера
-    /// Возвращает true, если fd успешно добавлен, false если fd уже существует или не удалось создать буферы
-    pub fn add_fd(
-        &mut self,
-        fd: i32,
-        events: i16,
-    ) -> bool {
+    /// Добавляет новый файловый дескриптор в массив fds
+    /// Возвращает true, если fd успешно добавлен, false если fd уже существует
+    pub fn add_fd(&self, fd: i32, events: i16) -> bool {
+        let mut state = self.state.lock().unwrap();
+        
         // Проверяем, есть ли уже такой fd
-        if self.fds_map.contains_key(&fd) {
+        if state.fds_map.contains_key(&fd) {
             return false;
         }
 
@@ -76,63 +75,33 @@ impl UnixPoll {
         };
 
         // Добавляем fd в вектор для poll
-        self.fds.push(pollfd);
+        state.fds.push(pollfd);
 
         // Сохраняем индекс в HashMap
-        let index = self.fds.len() - 1;
-        self.fds_map.insert(fd, index);
-
-        // Обновляем указатель и длину в raw структуре
-        self.update_raw();
+        let index = state.fds.len() - 1;
+        state.fds_map.insert(fd, index);
 
         true
     }
 
     /// Добавляет новый файловый дескриптор с попыткой создать буферы указанного размера
-    /// Если не удается выделить память указанного размера, пытается создать буферы меньшего размера
-    pub fn add_fd_with_fallback(
-        &mut self,
-        fd: i32,
-        events: i16,
-    ) -> bool {
-        // Проверяем, есть ли уже такой fd
-        if self.fds_map.contains_key(&fd) {
-            return false;
-        }
-
-        let pollfd = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-
-        // Добавляем fd в вектор для poll
-        self.fds.push(pollfd);
-
-        // Сохраняем индекс в HashMap
-        let index = self.fds.len() - 1;
-        self.fds_map.insert(fd, index);
-
-        // Обновляем указатель и длину в raw структуре
-        self.update_raw();
-
-        true
+    pub fn add_fd_with_fallback(&self, fd: i32, events: i16) -> bool {
+        self.add_fd(fd, events)
     }
 
     /// Удаляет файловый дескриптор из массива fds
-    pub fn remove_fd(&mut self, fd: i32) -> bool {
-        if let Some(index) = self.fds_map.remove(&fd) {
+    pub fn remove_fd(&self, fd: i32) -> bool {
+        let mut state = self.state.lock().unwrap();
+        
+        if let Some(index) = state.fds_map.remove(&fd) {
             // Удаляем из вектора fds
-            self.fds.swap_remove(index);
+            state.fds.swap_remove(index);
 
             // Если мы удалили не последний элемент, нужно обновить индекс
-            if index < self.fds.len() {
-                let moved_fd = self.fds[index].fd;
-                self.fds_map.insert(moved_fd, index);
+            if index < state.fds.len() {
+                let moved_fd = state.fds[index].fd;
+                state.fds_map.insert(moved_fd, index);
             }
-
-            // Обновляем указатель и длину в raw структуре
-            self.update_raw();
 
             true
         } else {
@@ -140,97 +109,31 @@ impl UnixPoll {
         }
     }
 
-    /// Получает срез fds для чтения
-    pub fn fds(&self) -> &[libc::pollfd] {
-        &self.fds
+    /// Получает копию текущего состояния fds
+    /// Это безопасно для многопоточности, так как возвращается копия
+    pub fn fds(&self) -> Vec<libc::pollfd> {
+        let state = self.state.lock().unwrap();
+        state.fds.clone()
     }
 
+    /// Получает количество файловых дескрипторов
     pub fn len(&self) -> usize {
-        self.fds.len()
+        let state = self.state.lock().unwrap();
+        state.fds.len()
     }
 
+    /// Проверяет, пуст ли список файловых дескрипторов
     pub fn is_empty(&self) -> bool {
-        self.fds.is_empty()
-    }
-
-    /// Получает изменяемый срез fds
-    pub fn fds_mut(&mut self) -> &mut [libc::pollfd] {
-        &mut self.fds
-    }
-
-    /// Получает изменяемую ссылку на pollfd для указанного fd
-    pub fn get_fd_mut(&mut self, fd: RawFd) -> Option<&mut libc::pollfd> {
-        self.fds_map
-            .get(&fd)
-            .copied()
-            .map(move |index| &mut self.fds[index])
-    }
-
-    /// Очищает массив fds
-    pub fn clear_fds(&mut self) {
-        self.fds.clear();
-        self.fds_map.clear();
-        // self.fds_buffer.clear();
-
-        // Обновляем указатель и длину в raw структуре
-        self.update_raw();
-    }
-
-    /// Обновляет указатель и длину в raw структуре
-    fn update_raw(&mut self) {
-        self.raw.fds_ptr = if self.fds.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            self.fds.as_mut_ptr()
-        };
-
-        self.raw.fds_len = self.fds.len();
-    }
-
-    /// Получает ссылку на C-совместимую структуру
-    pub fn as_raw(&self) -> &UnixPollRaw {
-        &self.raw
-    }
-
-    /// Получает изменяемую ссылку на C-совместимую структуру
-    pub fn as_raw_mut(&mut self) -> &mut UnixPollRaw {
-        &mut self.raw
-    }
-
-    /// Получает результат poll
-    pub fn get_result(&self) -> i32 {
-        self.raw.result
-    }
-
-    /// Устанавливает результат poll
-    pub fn set_result(&mut self, result: i32) {
-        self.raw.result = result;
-    }
-
-    /// Получает timeout
-    pub fn get_timeout(&self) -> i32 {
-        self.raw.timeout
-    }
-
-    /// Устанавливает timeout
-    pub fn set_timeout(&mut self, timeout: i32) {
-        self.raw.timeout = timeout;
-    }
-
-    /// Проверяет наличие файлового дескриптора
-    pub fn has_fd(&self, fd: RawFd) -> bool {
-        self.fds_map.contains_key(&fd)
-    }
-
-    /// Получает индекс файлового дескриптора в массиве fds
-    pub fn get_fd_index(&self, fd: RawFd) -> Option<usize> {
-        self.fds_map.get(&fd).copied()
+        let state = self.state.lock().unwrap();
+        state.fds.is_empty()
     }
 
     /// Обновляет события для указанного fd
-    pub fn upd_events(&mut self, fd: RawFd, events: i16) -> bool {
-        if let Some(&index) = self.fds_map.get(&fd) {
-            self.fds[index].events = events;
+    pub fn upd_events(&self, fd: RawFd, events: i16) -> bool {
+        let mut state = self.state.lock().unwrap();
+        
+        if let Some(&index) = state.fds_map.get(&fd) {
+            state.fds[index].events = events;
             true
         } else {
             false
@@ -239,18 +142,23 @@ impl UnixPoll {
 
     /// Получает события для указанного fd
     pub fn get_events(&self, fd: RawFd) -> Option<i16> {
-        self.fds_map.get(&fd).map(|&index| self.fds[index].events)
+        let state = self.state.lock().unwrap();
+        state.fds_map.get(&fd).map(|&index| state.fds[index].events)
     }
 
     /// Получает возвращенные события для указанного fd
     pub fn get_revents(&self, fd: RawFd) -> Option<i16> {
-        self.fds_map.get(&fd).map(|&index| self.fds[index].revents)
+        let state = self.state.lock().unwrap();
+        state.fds_map.get(&fd).map(|&index| state.fds[index].revents)
     }
 
-    /// сбрасывает возвращенные события для указанного fd
-    pub fn reset_revents(&mut self, fd: RawFd) -> bool {
-        if let Some(index) = self.fds_map.get(&fd) {
-            self.fds[*index].revents = 0;
+    /// Сбрасывает возвращенные события для указанного fd
+    pub fn reset_revents(&self, fd: RawFd) -> bool {
+        let mut state = self.state.lock().unwrap();
+        
+        // Сначала получаем копию индекса, а не ссылку
+        if let Some(&index) = state.fds_map.get(&fd) {
+            state.fds[index].revents = 0;
             return true;
         }
 
@@ -259,35 +167,117 @@ impl UnixPoll {
 
     /// Проверяет, установлен ли указанный флаг в revents для fd
     pub fn has_reevent(&self, fd: RawFd, event_flag: i16) -> bool {
-        self.get_revents(fd)
-            .is_some_and(|revents| (revents & event_flag) != 0)
+        let state = self.state.lock().unwrap();
+        
+        state.fds_map.get(&fd)
+            .map(|&index| (state.fds[index].revents & event_flag) != 0)
+            .unwrap_or(false)
     }
 
     /// Итератор по всем fd с установленными revents
-    pub fn iter_ready_fds(&self) -> impl Iterator<Item = (RawFd, i16)> + '_ {
-        self.fds
-            .iter()
+    /// Возвращает копию данных для безопасности в многопоточной среде
+    pub fn iter_ready_fds(&self) -> Vec<(RawFd, i16)> {
+        let state = self.state.lock().unwrap();
+        
+        state.fds.iter()
             .filter(|pollfd| pollfd.revents != 0)
             .map(|pollfd| (pollfd.fd, pollfd.revents))
+            .collect()
     }
 
     /// Получает C-совместимый массив файловых дескрипторов
-    /// Полезно для передачи в C-код
     pub fn get_fds_array(&self) -> Vec<i32> {
-        self.fds.iter().map(|pollfd| pollfd.fd).collect()
+        let state = self.state.lock().unwrap();
+        state.fds.iter().map(|pollfd| pollfd.fd).collect()
     }
-}
 
-// Реализуем конвертацию из UnixPoll в UnixPollRaw для C-функций
-impl AsRef<UnixPollRaw> for UnixPoll {
-    fn as_ref(&self) -> &UnixPollRaw {
-        &self.raw
+    /// Очищает массив fds
+    pub fn clear_fds(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.fds.clear();
+        state.fds_map.clear();
     }
-}
 
-// Реализуем конвертацию из &mut UnixPoll в &mut UnixPollRaw для C-функций
-impl AsMut<UnixPollRaw> for UnixPoll {
-    fn as_mut(&mut self) -> &mut UnixPollRaw {
-        &mut self.raw
+    /// Получает результат poll
+    pub fn get_result(&self) -> i32 {
+        self.result.load(Ordering::SeqCst)
+    }
+
+    /// Устанавливает результат poll
+    pub fn set_result(&self, result: i32) {
+        self.result.store(result, Ordering::SeqCst);
+    }
+
+    /// Получает timeout
+    pub fn get_timeout(&self) -> i32 {
+        let timeout = self.timeout.read().unwrap();
+        *timeout
+    }
+
+    /// Устанавливает timeout
+    pub fn set_timeout(&self, timeout: i32) {
+        let mut timeout_guard = self.timeout.write().unwrap();
+        *timeout_guard = timeout;
+    }
+
+    /// Проверяет наличие файлового дескриптора
+    pub fn has_fd(&self, fd: RawFd) -> bool {
+        let state = self.state.lock().unwrap();
+        state.fds_map.contains_key(&fd)
+    }
+
+    /// Получает индекс файлового дескриптора в массиве fds
+    pub fn get_fd_index(&self, fd: RawFd) -> Option<usize> {
+        let state = self.state.lock().unwrap();
+        state.fds_map.get(&fd).copied()
+    }
+
+    /// Создает C-совместимую структуру для использования в функциях poll
+    /// Важно: эта структура действительна только до следующего изменения UnixPoll
+    pub fn as_raw(&self) -> UnixPollRaw {
+        let state = self.state.lock().unwrap();
+        let timeout = self.get_timeout();
+        let result = self.get_result();
+        
+        let fds_ptr = if state.fds.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            // ВНИМАНИЕ: Это небезопасно для многопоточности!
+            // Указатель действителен только пока существует блокировка state
+            // Используйте этот метод только для кратковременных операций
+            state.fds.as_ptr() as *mut libc::pollfd
+        };
+        
+        UnixPollRaw {
+            fds_ptr,
+            fds_len: state.fds.len(),
+            timeout,
+            result,
+        }
+    }
+
+    /// Безопасный метод для выполнения poll
+    /// Этот метод блокирует состояние на время выполнения poll
+    pub fn do_poll(&self) -> i32 {
+        let mut state = self.state.lock().unwrap();
+        let timeout = self.get_timeout();
+        
+        if state.fds.is_empty() {
+            return 0;
+        }
+        
+        // Выполняем poll, пока state заблокирован
+        let result = unsafe {
+            libc::poll(
+                state.fds.as_mut_ptr(),
+                state.fds.len() as libc::nfds_t,
+                timeout,
+            )
+        };
+        
+        // Сохраняем результат
+        self.set_result(result);
+        
+        result
     }
 }

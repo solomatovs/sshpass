@@ -1,21 +1,25 @@
-use libloading::{Library};
+use std::sync::Arc;
+use libloading::Library;
 
-
-use abstractions::{warn, info, PluginManager};
+use abstractions::{warn, info, PluginManager, PluginStatus, PluginType};
 use common::UnixContext;
-use common::plugin::{PluginLoader};
-
+use common::plugin::PluginLoader;
 
 pub struct App {
-    context: UnixContext,
+    // Теперь храним Arc<UnixContext> вместо UnixContext
+    context: Arc<UnixContext>,
     plugin_manager: PluginManager<UnixContext, Library>,
 }
 
 impl App {
     pub fn new(context: UnixContext) -> Self {
+        // Оборачиваем контекст в Arc при создании App
+        let context_arc = Arc::new(context);
+        
         Self {
-            context,
-            plugin_manager: PluginManager::new(),
+            // Передаем клон Arc в plugin_manager
+            plugin_manager: PluginManager::new(context_arc.clone()),
+            context: context_arc,
         }
     }
 
@@ -35,9 +39,10 @@ impl App {
         );
         
         // Применяем только необходимые изменения
+        // Передаем Arc<UnixContext> вместо &mut UnixContext
         let res = PluginLoader::apply_config_changes(
             &mut self.plugin_manager,
-            &mut self.context,
+            self.context.clone(),
             changes,
         );
     
@@ -60,59 +65,41 @@ impl App {
 
     pub fn processing(&mut self) {
         // Получаем список плагинов, которые нужно обработать
-
         for plugin in self.plugin_manager.get_plugins() {
             // Вызываем handle для плагина
             let result = match &mut plugin.status {
-                abstractions::PluginStatus::Enable(plugin_type) => {
+                PluginStatus::Enable(plugin_type) => {
                     match plugin_type {
-                        abstractions::PluginType::Rust { plugin, .. } => {
-                            plugin.handle(&mut self.context)
+                        PluginType::Rust {plugin, .. } => {
+                            // Теперь handle принимает &self вместо &mut self
+                            plugin.handle()
                         },
-                        abstractions::PluginType::C { plugin, .. } => {
+                        PluginType::C { plugin, .. } => {
                             unsafe {
-                                (plugin.handle)(plugin.get_raw(), &mut self.context)
+                                // Для C-плагинов используем внутренний контекст плагина
+                                (plugin.handle)(plugin.get_raw(), std::ptr::null_mut())
                             }
                         }
                     }
                 },
-                abstractions::PluginStatus::Unloaded => 1,          // Плагин выгружен
-                abstractions::PluginStatus::Disable(_) => 0,        // Плагин отключен
-                abstractions::PluginStatus::LoadingFailed{..} => 0,  // Плагин не загрузился
+                PluginStatus::Unloaded => 1,          // Плагин выгружен
+                PluginStatus::Disable(_) => 0,        // Плагин отключен
+                PluginStatus::LoadingFailed{..} => 0,  // Плагин не загрузился
             };
             
             // Если плагин вернул 1, это значит, что он готов к выгрузке
             if result == 1 {
-                // Вызываем free для плагина
-                match &mut plugin.status {
-                    abstractions::PluginStatus::Enable(plugin_type) => {
-                        match plugin_type {
-                            abstractions::PluginType::Rust { plugin, .. } => {
-                                plugin.free(&mut self.context);
-                            },
-                            abstractions::PluginType::C { plugin, .. } => {
-                                unsafe {
-                                    (plugin.free)(plugin.get_raw(), &mut self.context);
-                                }
-                            }
-                        }
-                    },
-                    _ => {} // Для отключенных или не загруженных плагинов ничего не делаем
-                }
-                
-                // Отмечаем плагин как выгруженный
-                plugin.status = abstractions::PluginStatus::Unloaded;
-                
-                // Не увеличиваем i, так как следующий элемент теперь имеет тот же индекс
+                // Больше не нужно явно вызывать free, это будет сделано в Drop
+                // Просто отмечаем плагин как выгруженный
+                plugin.status = PluginStatus::Unloaded;
                 continue;
             }
         }
 
         // Проверяем, нужно ли перезагрузить конфигурацию
-        if self.context.reload_config {
+        if self.context.reload_config.check_and_reset() {
             info!(self.context, "Reloading configuration due to file change");
             self.reload_config();
-            self.context.reload_config = false; // Сбрасываем флаг
         }
     }
 }

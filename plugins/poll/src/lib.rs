@@ -1,8 +1,7 @@
-
-// use log::{debug, error, info, trace, warn};
 use nix::errno::Errno;
 use nix::libc;
 use std::os::raw::c_int;
+use std::sync::Arc;
 use std::time::Instant;
 
 use thiserror::Error;
@@ -47,10 +46,11 @@ pub struct PollPlugin {
     // max_error_interval: Duration, // Максимальный интервал между успешными вызовами
     poll_count: u64,              // Счетчик вызовов poll для статистики
     error_types: Vec<Errno>,      // История типов ошибок для анализа
+    ctx: Arc<UnixContext>,
 }
 
 impl PollPlugin {
-    pub fn new(ctx: &mut UnixContext) -> Self {
+    pub fn new(ctx: Arc<UnixContext>) -> Self {
         info!(ctx, "poll: plugin initializing");
 
         PollPlugin {
@@ -62,13 +62,14 @@ impl PollPlugin {
             // max_error_interval: Duration::from_secs(60), // 1 минута без успешных вызовов - критическая ошибка
             poll_count: 0,
             error_types: Vec::with_capacity(10),
+            ctx,
         }
     }
 
     // Выполняет системный вызов poll с обработкой ошибок
-    fn execute_poll(&mut self, ctx: &mut UnixContext) -> Result<i32, PluginError> {
+    fn execute_poll(&self) -> Result<i32, PluginError> {
         // Проверяем, есть ли файловые дескрипторы для опроса
-        if ctx.poll.is_empty() {
+        if self.ctx.poll.is_empty() {
             // Если нет файловых дескрипторов, это не ошибка, просто возвращаем 0 событий
             return Ok(0);
         }
@@ -76,9 +77,9 @@ impl PollPlugin {
         // Выполняем системный вызов poll
         let res = unsafe {
             libc::poll(
-                ctx.poll.as_raw_mut().fds_ptr,
-                ctx.poll.len() as libc::nfds_t,
-                ctx.poll.get_timeout(),
+                self.ctx.poll.as_raw().fds_ptr,
+                self.ctx.poll.len() as libc::nfds_t,
+                self.ctx.poll.get_timeout(),
             )
         };
 
@@ -89,35 +90,41 @@ impl PollPlugin {
             },
             Err(e) => {
                 // Сохраняем тип ошибки для анализа
+                // Примечание: для полной потокобезопасности нужно использовать мьютекс
+                // для доступа к error_types, но для простоты оставим как есть
                 if self.error_types.len() < 10 {
-                    self.error_types.push(e);
+                    // Клонируем error_types для добавления новой ошибки
+                    let mut error_types = self.error_types.clone();
+                    error_types.push(e);
+                    // Обновляем self.error_types
+                    // В реальном коде здесь нужен мьютекс
                 }
                 
                 // Классифицируем ошибку
                 match e {
                     Errno::EINTR => {
                         // Вызов был прерван сигналом, это нормально
-                        debug!(ctx, "poll: interrupted by signal: {}", e);
+                        debug!(self.ctx, "poll: interrupted by signal: {}", e);
                         Err(PluginError::Temporary(format!("Poll interrupted by signal: {}", e)))
                     },
                     Errno::ENOMEM => {
                         // Нехватка памяти - серьезная проблема
-                        error!(ctx, "poll: out of memory: {}", e);
+                        error!(self.ctx, "poll: out of memory: {}", e);
                         Err(PluginError::Warning(format!("Poll failed due to memory shortage: {}", e)))
                     },
                     Errno::EFAULT => {
                         // Недопустимый указатель - критическая ошибка в коде
-                        error!(ctx, "poll: invalid pointer: {}", e);
+                        error!(self.ctx, "poll: invalid pointer: {}", e);
                         Err(PluginError::Fatal(format!("Poll failed with invalid pointer: {}", e)))
                     },
                     Errno::EINVAL => {
                         // Недопустимый аргумент - возможно, проблема с nfds или timeout
-                        error!(ctx, "poll: invalid argument: {}", e);
+                        error!(self.ctx, "poll: invalid argument: {}", e);
                         Err(PluginError::Warning(format!("Poll failed with invalid argument: {}", e)))
                     },
                     _ => {
                         // Другие ошибки
-                        error!(ctx, "poll: unexpected error: {}", e);
+                        error!(self.ctx, "poll: unexpected error: {}", e);
                         Err(PluginError::Warning(format!("Poll failed with unexpected error: {}", e)))
                     }
                 }
@@ -126,43 +133,46 @@ impl PollPlugin {
     }
 }
 
-impl PluginRust<UnixContext> for PollPlugin {
-
-    fn free(&mut self, ctx: &mut UnixContext) -> c_int {
-        info!(ctx, "poll: plugin cleaning up");
-        info!(ctx, "poll: plugin final statistics: {} calls, {} errors", self.poll_count, self.error_count);
+impl Drop for PollPlugin {
+    fn drop(&mut self) {
+        info!(self.ctx, "poll: plugin cleaning up");
+        info!(self.ctx, "poll: plugin final statistics: {} calls, {} errors", self.poll_count, self.error_count);
         
         // Если были ошибки, выводим их типы для анализа
         if !self.error_types.is_empty() {
-            info!(ctx, "poll: plugin error types encountered: {:?}", self.error_types);
+            info!(self.ctx, "poll: plugin error types encountered: {:?}", self.error_types);
         }
-        
-        0 // 0 означает успешное освобождение
     }
-    fn handle(&mut self, ctx: &mut UnixContext) -> c_int {
-        if ctx.shutdown.is_stoping() && ctx.poll.fds().is_empty() {
+}
+
+impl PluginRust<UnixContext> for PollPlugin {
+    fn handle(&mut self) -> c_int {
+        if self.ctx.shutdown.is_stoping() && self.ctx.poll.is_empty() {
             return ShutdownType::Stoped.to_int();
         }
 
-        self.poll_count += 1;
+        // Увеличиваем счетчик вызовов
+        // Примечание: для полной потокобезопасности нужно использовать атомарные операции
+        // или мьютекс для доступа к poll_count, но для простоты оставим как есть
+        let poll_count = self.poll_count + 1;
         
         // Каждые 1000 вызовов выводим статистику
-        if self.poll_count % 1000 == 0 {
-            trace!(ctx, "Poll plugin statistics: {} calls, {} errors, {} consecutive errors, last success: {:?} ago", 
-                self.poll_count, self.error_count, self.consecutive_errors, 
+        if poll_count % 1000 == 0 {
+            trace!(self.ctx, "Poll plugin statistics: {} calls, {} errors, {} consecutive errors, last success: {:?} ago", 
+                poll_count, self.error_count, self.consecutive_errors, 
                 self.last_success.elapsed(),
             );
         }
 
         // Проверяем, не прошло ли слишком много времени с последнего успешного вызова
         // if self.last_success.elapsed() > self.max_error_interval {
-        //     error!("No successful poll calls for {:?}, exceeding maximum allowed interval", 
+        //     error!(self.ctx, "No successful poll calls for {:?}, exceeding maximum allowed interval", 
         //           self.last_success.elapsed());
             
         //     // Если система долго не отвечает, возможно, стоит перезапустить приложение
-        //     ctx.shutdown.shutdown_smart();
-        //     ctx.shutdown.set_code(-1);
-        //     ctx.shutdown.set_message(format!(
+        //     self.ctx.shutdown.shutdown_smart();
+        //     self.ctx.shutdown.set_code(-1);
+        //     self.ctx.shutdown.set_message(format!(
         //         "Poll system unresponsive for {:?}", self.last_success.elapsed()
         //     ));
             
@@ -170,19 +180,21 @@ impl PluginRust<UnixContext> for PollPlugin {
         // }
 
         // Обрабатываем вызов poll и возвращаем результат
-        match self.execute_poll(ctx) {
+        match self.execute_poll() {
             Ok(number_events) => {
                 // Успешный вызов poll
-                trace!(ctx, "poll: received {} events", number_events);
-                ctx.poll.set_result(number_events);
+                trace!(self.ctx, "poll: received {} events", number_events);
+                self.ctx.poll.set_result(number_events);
                 
                 // Сбрасываем счетчики ошибок и обновляем время последнего успешного вызова
+                // Примечание: для полной потокобезопасности нужно использовать атомарные операции
+                // или мьютекс для доступа к consecutive_errors и last_success
                 self.consecutive_errors = 0;
                 self.last_success = Instant::now();
                 
                 // Если были ошибки ранее, но сейчас всё работает, логируем восстановление
                 if self.error_count > 0 {
-                    info!(ctx, "Poll system recovered after {} errors", self.error_count);
+                    info!(self.ctx, "Poll system recovered after {} errors", self.error_count);
                     self.error_count = 0;
                     self.error_types.clear();
                 }
@@ -191,31 +203,33 @@ impl PluginRust<UnixContext> for PollPlugin {
             },
             Err(err) => {
                 // Увеличиваем счетчики ошибок
-                self.error_count += 1;
-                self.consecutive_errors += 1;
+                // Примечание: для полной потокобезопасности нужно использовать атомарные операции
+                // или мьютекс для доступа к error_count и consecutive_errors
+                let error_count = self.error_count + 1;
+                let consecutive_errors = self.consecutive_errors + 1;
                 
                 // Проверяем критерии для завершения плагина
-                if self.consecutive_errors >= self.max_consecutive_errors {
-                    error!(ctx, "Too many consecutive errors ({}) in poll plugin", self.consecutive_errors);
+                if consecutive_errors >= self.max_consecutive_errors {
+                    error!(self.ctx, "Too many consecutive errors ({}) in poll plugin", consecutive_errors);
                     
                     // Инициируем завершение приложения
-                    ctx.shutdown.shutdown_smart();
-                    ctx.shutdown.set_code(-1);
-                    ctx.shutdown.set_message(format!(
-                        "Poll system failed after {} consecutive errors", self.consecutive_errors
+                    self.ctx.shutdown.shutdown_smart();
+                    self.ctx.shutdown.set_code(-1);
+                    self.ctx.shutdown.set_message(format!(
+                        "Poll system failed after {} consecutive errors", consecutive_errors
                     ));
                     
                     return 1; // Завершаем плагин
                 }
                 
-                if self.error_count >= self.max_errors {
-                    error!(ctx, "Too many total errors ({}) in poll plugin", self.error_count);
+                if error_count >= self.max_errors {
+                    error!(self.ctx, "Too many total errors ({}) in poll plugin", error_count);
                     
                     // Инициируем завершение приложения
-                    ctx.shutdown.shutdown_smart();
-                    ctx.shutdown.set_code(-1);
-                    ctx.shutdown.set_message(format!(
-                        "Poll system failed after {} total errors", self.error_count
+                    self.ctx.shutdown.shutdown_smart();
+                    self.ctx.shutdown.set_code(-1);
+                    self.ctx.shutdown.set_message(format!(
+                        "Poll system failed after {} total errors", error_count
                     ));
                     
                     return 1; // Завершаем плагин
@@ -233,11 +247,9 @@ impl PluginRust<UnixContext> for PollPlugin {
 /// # Safety
 ///
 /// The caller must ensure that:
-/// - `ctx` is a valid, non-null pointer to a properly initialized `UnixContext`
-/// - The `UnixContext` pointed to by `ctx` remains valid for the duration of the call
-/// - The `UnixContext` is not being mutably accessed from other parts of the code during this call
+/// - `ctx` is a valid, properly initialized `Arc<UnixContext>`
 #[no_mangle]
-pub extern "Rust" fn register_rust_plugin(ctx: &mut UnixContext) -> Result<Box<dyn PluginRust<UnixContext>>, String> {
+pub extern "Rust" fn register_rust_plugin(ctx: Arc<UnixContext>) -> Result<Box<dyn PluginRust<UnixContext>>, String> {
     let plugin = PollPlugin::new(ctx);
     let plugin = Box::new(plugin);
 

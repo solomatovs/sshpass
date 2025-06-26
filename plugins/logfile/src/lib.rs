@@ -3,7 +3,7 @@ use nix::sys::eventfd::{EventFd, EfdFlags};
 use nix::sys::timerfd::{ClockId, TimerFd, TimerFlags, Expiration, TimerSetTimeFlags};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::os::fd::{AsFd, RawFd};
 use std::os::raw::c_int;
 use std::os::unix::io::AsRawFd;
@@ -12,9 +12,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use abstractions::LogEntryStack;
-use abstractions::buffer::Buffer;
-use abstractions::PluginRust;
+use abstractions::{info, LogEntryStack, PluginRust, buffer::Buffer};
 use common::read_fd::{read_fd, ReadResult};
 use common::UnixContext;
 
@@ -60,35 +58,46 @@ impl FdHandler {
         }
     }
 
-    fn register_with_poll(&self, ctx: &mut UnixContext) -> Result<(), String> {
+    fn register_with_poll(&self, ctx: &UnixContext) -> Result<(), String> {
         let flags = PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL;
         ctx.poll.add_fd(self.fd, flags.bits());
         Ok(())
     }
 
-    fn unregister_from_poll(&self, ctx: &mut UnixContext) -> bool {
+    fn unregister_from_poll(&self, ctx: &UnixContext) -> bool {
         ctx.poll.remove_fd(self.fd)
     }
 
-    fn process_signal(&mut self, ctx: &mut UnixContext) -> Result<bool, PluginError> {
-        let poll_entry = ctx.poll.get_fd_mut(self.fd)
-            .ok_or_else(|| PluginError::RecoverableFdError(format!("fd {} not registered", self.fd)))?;
+    fn process_signal(&mut self, ctx: &UnixContext) -> Result<bool, PluginError> {
+        // Проверяем, есть ли наш fd в poll
+        if !ctx.poll.has_fd(self.fd) {
+            return Err(PluginError::RecoverableFdError(format!("fd {} not registered", self.fd)));
+        }
         
-        if poll_entry.revents == 0 {
+        // Получаем revents для нашего fd
+        let revents = match ctx.poll.get_revents(self.fd) {
+            Some(revents) => revents,
+            None => return Ok(false), // Нет событий
+        };
+        
+        if revents == 0 {
             return Ok(false);
         }
 
-        let revents = PollFlags::from_bits(poll_entry.revents)
-            .ok_or_else(|| PluginError::RecoverableFdError(format!("Unknown revents: {}", poll_entry.revents)))?;
+        let revents_flags = match PollFlags::from_bits(revents) {
+            Some(flags) => flags,
+            None => return Err(PluginError::RecoverableFdError(format!("Unknown revents: {}", revents))),
+        };
 
-        if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+        if revents_flags.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
             return Err(PluginError::RecoverableFdError(format!("FD issue on {}", self.fd)));
         }
 
-        if revents.contains(PollFlags::POLLIN) {
+        if revents_flags.contains(PollFlags::POLLIN) {
             match read_fd(self.fd, &mut self.buffer) {
                 ReadResult::Success(_) => {
-                    poll_entry.revents = 0;
+                    // Сбрасываем revents после обработки
+                    ctx.poll.reset_revents(self.fd);
                     self.buffer.clear();
                     return Ok(true);
                 }
@@ -114,6 +123,8 @@ impl FdHandler {
             }
         }
 
+        // Сбрасываем revents после обработки
+        ctx.poll.reset_revents(self.fd);
         Ok(false)
     }
 }
@@ -123,7 +134,7 @@ impl FdHandler {
 struct TimerHandler {
     // timer_fd: TimerFd,
     fd_handler: FdHandler,
-    interval_secs: u64,
+    // interval_secs: u64,
 }
 
 impl TimerHandler {
@@ -141,19 +152,19 @@ impl TimerHandler {
         Ok(Self {
             // timer_fd,
             fd_handler,
-            interval_secs,
+            // interval_secs,
         })
     }
 
-    fn register(&self, ctx: &mut UnixContext) -> Result<(), String> {
+    fn register(&self, ctx: &UnixContext) -> Result<(), String> {
         self.fd_handler.register_with_poll(ctx)
     }
 
-    fn unregister(&self, ctx: &mut UnixContext) -> bool {
+    fn unregister(&self, ctx: &UnixContext) -> bool {
         self.fd_handler.unregister_from_poll(ctx)
     }
 
-    fn process_signal(&mut self, ctx: &mut UnixContext) -> Result<bool, PluginError> {
+    fn process_signal(&mut self, ctx: &UnixContext) -> Result<bool, PluginError> {
         self.fd_handler.process_signal(ctx)
     }
 }
@@ -179,15 +190,15 @@ impl EventHandler {
         })
     }
 
-    fn register(&self, ctx: &mut UnixContext) -> Result<(), String> {
+    fn register(&self, ctx: &UnixContext) -> Result<(), String> {
         self.fd_handler.register_with_poll(ctx)
     }
 
-    fn unregister(&self, ctx: &mut UnixContext) -> bool {
+    fn unregister(&self, ctx: &UnixContext) -> bool {
         self.fd_handler.unregister_from_poll(ctx)
     }
 
-    fn process_signal(&mut self, ctx: &mut UnixContext) -> Result<bool, PluginError> {
+    fn process_signal(&mut self, ctx: &UnixContext) -> Result<bool, PluginError> {
         self.fd_handler.process_signal(ctx)
     }
 }
@@ -246,7 +257,7 @@ impl LogFileHandler {
         }
     }
 
-    fn write_entry(&mut self, entry: &LogEntryStack) -> Result<bool, PluginError> {
+    fn write_entry(&mut self, entry: LogEntryStack) -> Result<bool, PluginError> {
         // Если недавно была ошибка, и еще не прошло время для повторной попытки, пропускаем
         if !self.can_retry() {
             return Ok(false);
@@ -286,21 +297,24 @@ impl LogFileHandler {
 pub struct LogPlugin {
     timer: TimerHandler,    // Обработчик таймера для периодического сброса
     event: EventHandler,    // Обработчик событий для уведомления о новых логах
-    log: LogFileHandler,    // Обработчик файла лога
+    log: Mutex<LogFileHandler>,    // Обработчик файла лога (защищен мьютексом для потокобезопасности)
+    error_count: Mutex<usize>,     // Счетчик ошибок (защищен мьютексом)
+    max_errors: usize,             // Максимальное количество ошибок
+    ctx: Arc<UnixContext>,
 }
 
-
 impl LogPlugin {
-    fn flush_all(&mut self, ctx: &mut UnixContext) -> Result<(), PluginError> {
+    fn flush_all(&self) -> Result<(), PluginError> {
         let mut entries_written = 0;
         let mut had_errors = false;
+        let mut log = self.log.lock().unwrap();
 
         // Обрабатываем все доступные записи
-        while let Some(entry) = ctx.log_buffer.peek() {
-            match self.log.write_entry(entry) {
+        while let Some(entry) = self.ctx.log_buffer.peek() {
+            match log.write_entry(entry) {
                 Ok(true) => {
                     // Успешно записали, удаляем из очереди
-                    ctx.log_buffer.dequeue();
+                    self.ctx.log_buffer.dequeue();
                     entries_written += 1;
                 },
                 Ok(false) => {
@@ -325,174 +339,163 @@ impl LogPlugin {
 
         // Если были ошибки, но мы все равно записали что-то, считаем это успехом
         if had_errors && entries_written > 0 {
-            // info!(ctx, "Partially flushed logs: {} of {} entries written", entries_written, entries_processed);
+            // info!(self.ctx, "Partially flushed logs: {} of {} entries written", entries_written, entries_processed);
         } else if entries_written > 0 {
-            // info!(ctx, "Successfully flushed {} log entries", entries_written);
+            // info!(self.ctx, "Successfully flushed {} log entries", entries_written);
         }
 
         Ok(())
     }
 
-    pub fn new(ctx: &mut UnixContext) -> Result<Self, String> {
-        // info!(ctx, "Creating new LogPlugin instance");
+    pub fn new(ctx: Arc<UnixContext>) -> Result<Self, String> {
+        info!(ctx, "Creating new LogPlugin instance");
 
         let log = LogFileHandler::new("application.log");
         let timer = TimerHandler::new(10)?;
         let event = EventHandler::new()?;
         
-        // Регистрируем обработчики в poll
-        timer.register(ctx)?;
-        event.register(ctx)?;
+        // Регистрируем файловые дескрипторы в poll
+        timer.register(&ctx)?;
+        event.register(&ctx)?;
         
-        // Устанавливаем event fd для уведомлений о новых логах
-        ctx.log_buffer.set_notify_event_fd(Some(event.event_fd.clone()));
-
-        Ok(Self {
+        // Устанавливаем event_fd в log_buffer для уведомлений о новых логах
+        if let Err(e) = ctx.log_buffer.set_notify_event_fd(Some(event.event_fd.clone())) {
+            return Err(e.to_string());
+        }
+        
+        Ok(LogPlugin {
             timer,
             event,
-            log,
+            log: Mutex::new(log),
+            error_count: Mutex::new(0),
+            max_errors: 100,
+            ctx,
         })
     }
+}
 
-    // Метод для восстановления файловых дескрипторов
-    // Метод для восстановления файловых дескрипторов
-    fn recover_fd(&mut self, ctx: &mut UnixContext) -> Result<(), String> {
-        // info!(ctx, "Recovering file descriptors");
+impl Drop for LogPlugin {
+    fn drop(&mut self) {
+        info!(self.ctx, "logfile: plugin cleaning up");
         
-        // Удаляем старые дескрипторы из poll
-        self.timer.unregister(ctx);
-        self.event.unregister(ctx);
+        // Отключаем уведомления от log_buffer
+        let _ = self.ctx.log_buffer.set_notify_event_fd(None);
         
-        // Переинициализируем обработчики
-        let new_timer = TimerHandler::new(self.timer.interval_secs)?;
-        let new_event = EventHandler::new()?;
+        // Удаляем файловые дескрипторы из poll
+        self.timer.unregister(&self.ctx);
+        self.event.unregister(&self.ctx);
         
-        // Регистрируем новые обработчики
-        new_timer.register(ctx)?;
-        new_event.register(ctx)?;
-        
-        // Устанавливаем новый event_fd в лог-буфер для уведомлений
-        ctx.log_buffer.set_notify_event_fd(Some(new_event.event_fd.clone()));
-        
-        // Обновляем обработчики в структуре плагина
-        self.timer = new_timer;
-        self.event = new_event;
-        
-        // info!(ctx, "Successfully recovered fds: timer={} event={}", self.timer.get_fd(), self.event.get_fd());
-        Ok(())
-    }
-
-    // Обработка событий с детальной обработкой ошибок
-    fn handle_events(&mut self, ctx: &mut UnixContext) -> Result<(), PluginError> {
-        let mut should_flush = false;
-
-        // Обрабатываем сигналы от таймера
-        match self.timer.process_signal(ctx) {
-            Ok(true) => {
-                // info!(ctx, "Timer signal received, will flush logs");
-                should_flush = true;
-            },
-            Ok(false) => {},
-            Err(e) => {
-                // warn!(ctx, "Error processing timer signal: {}", e);
-                // Для ошибок таймера пытаемся восстановиться
-                if let PluginError::RecoverableFdError(_) = e {
-                    if let Err(recover_err) = self.recover_fd(ctx) {
-                        // warn!(ctx, "Failed to recover timer fd: {}", recover_err);
-                        return Err(PluginError::RecoverableFdError(recover_err));
-                    }
-                } else {
-                    return Err(e);
-                }
-            }
+        // Сбрасываем все оставшиеся логи перед выходом
+        if let Err(e) = self.flush_all() {
+            // Здесь мы не можем использовать макрос error!, так как это может вызвать рекурсию
+            eprintln!("Error flushing logs during shutdown: {}", e);
         }
-
-        // Обрабатываем сигналы от event fd
-        match self.event.process_signal(ctx) {
-            Ok(true) => {
-                // info!(ctx, "Event signal received, will flush logs");
-                should_flush = true;
-            },
-            Ok(false) => {},
-            Err(e) => {
-                // warn!(ctx, "Error processing event signal: {}", e);
-                // Для ошибок event fd пытаемся восстановиться
-                if let PluginError::RecoverableFdError(_) = e {
-                    if let Err(recover_err) = self.recover_fd(ctx) {
-                        // warn!(ctx, "Failed to recover event fd: {}", recover_err);
-                        return Err(PluginError::RecoverableFdError(recover_err));
-                    }
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-
-        if should_flush {
-            // Пытаемся сбросить логи, но обрабатываем ошибки
-            match self.flush_all(ctx) {
-                Ok(_) => {},
-                Err(e) => {
-                    // warn!(ctx, "Error flushing logs: {}", e);
-                    // Для ошибок файла не прерываем работу, просто логируем
-                    if let PluginError::FileError(_) = e {
-                        // Ошибки файла не критичны, продолжаем работу
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 
 impl PluginRust<UnixContext> for LogPlugin {
-    fn free(&mut self, ctx: &mut UnixContext) -> c_int {
-        // Удаляем файловые дескрипторы из poll
-        self.timer.unregister(ctx);
-        self.event.unregister(ctx);
-
-        // Отключаем уведомления о новых логах
-        ctx.log_buffer.set_notify_event_fd(None);
-        // info!(ctx, "LogPlugin resources cleaned up");
-
-        0
-    }
-
-    fn handle(&mut self, ctx: &mut UnixContext) -> c_int {
-        match self.handle_events(ctx) {
-            Ok(_) => 0,
+    fn handle(&mut self) -> c_int {
+        // Проверяем, нужно ли завершить работу
+        if self.ctx.shutdown.is_stoping() {
+            // Сбрасываем все логи перед выходом
+            if let Err(e) = self.flush_all() {
+                eprintln!("Error flushing logs during shutdown: {}", e);
+            }
+            return 1; // Сигнализируем о завершении плагина
+        }
+        
+        // Если нет событий poll, ничего не делаем
+        if self.ctx.poll.get_result() <= 0 {
+            return 0;
+        }
+        
+        let mut should_flush = false;
+        
+        // Проверяем события таймера
+        match self.timer.process_signal(&self.ctx) {
+            Ok(true) => {
+                // Таймер сработал, нужно сбросить логи
+                should_flush = true;
+            },
+            Ok(false) => {
+                // Нет событий таймера
+            },
             Err(e) => {
-                // warn!(ctx, "Error in handle: {}", e);
-                if let PluginError::RecoverableFdError(_) = e {
-                    if let Err(_e) = self.recover_fd(ctx) {
-                        // warn!(ctx, "Failed to recover fds: {}", e);
-                        1
-                    } else {
-                        0
+                // Ошибка обработки таймера
+                eprintln!("Timer error: {}", e);
+                let mut error_count = self.error_count.lock().unwrap();
+                *error_count += 1;
+                
+                if *error_count > self.max_errors {
+                    eprintln!("Too many timer errors, shutting down log plugin");
+                    return 1; // Завершаем плагин
+                }
+                
+                // Для некритических ошибок продолжаем работу
+                return e.to_return_code();
+            }
+        }
+        
+        // Проверяем события eventfd
+        match self.event.process_signal(&self.ctx) {
+            Ok(true) => {
+                // Получено уведомление о новых логах
+                should_flush = true;
+            },
+            Ok(false) => {
+                // Нет событий eventfd
+            },
+            Err(e) => {
+                // Ошибка обработки eventfd
+                eprintln!("Event error: {}", e);
+                let mut error_count = self.error_count.lock().unwrap();
+                *error_count += 1;
+                
+                if *error_count > self.max_errors {
+                    eprintln!("Too many event errors, shutting down log plugin");
+                    return 1; // Завершаем плагин
+                }
+                
+                // Для некритических ошибок продолжаем работу
+                return e.to_return_code();
+            }
+        }
+        
+        // Если нужно сбросить логи, делаем это
+        if should_flush {
+            match self.flush_all() {
+                Ok(_) => {
+                    // Успешно сбросили логи
+                    let mut error_count = self.error_count.lock().unwrap();
+                    if *error_count > 0 {
+                        *error_count = 0; // Сбрасываем счетчик ошибок при успехе
                     }
-                } else {
-                    e.to_return_code()
+                },
+                Err(e) => {
+                    // Ошибка при сбросе логов
+                    eprintln!("Flush error: {}", e);
+                    let mut error_count = self.error_count.lock().unwrap();
+                    *error_count += 1;
+                    
+                    if *error_count > self.max_errors {
+                        eprintln!("Too many flush errors, shutting down log plugin");
+                        return 1; // Завершаем плагин
+                    }
+                    
+                    // Для некритических ошибок продолжаем работу
+                    return e.to_return_code();
                 }
             }
         }
+        
+        0 // Успешное выполнение
     }
 }
 
-/// Creates a new instance of LogPlugin.
-///
-/// # Safety
-///
-/// The caller must ensure that:
-/// - `ctx` is a valid, non-null pointer to a properly initialized `UnixContext`
-/// - The `UnixContext` pointed to by `ctx` remains valid for the duration of the call
-/// - The `UnixContext` is not being mutably accessed from other parts of the code during this call
 #[no_mangle]
-pub extern "Rust" fn register_rust_plugin(ctx: &mut UnixContext) -> Result<Box<dyn PluginRust<UnixContext>>, String> {
+pub extern "Rust" fn register_rust_plugin(ctx: Arc<UnixContext>) -> Result<Box<dyn PluginRust<UnixContext>>, String> {
     let plugin = LogPlugin::new(ctx)?;
     let plugin = Box::new(plugin);
-
+    
     Ok(plugin)
 }

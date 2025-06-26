@@ -1,5 +1,5 @@
 use libloading::{Library, Symbol};
-use std::fs;
+use std::{fs, sync::Arc};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -7,7 +7,7 @@ use toml::Value;
 use thiserror::Error;
 
 use abstractions::{
-    warn, CPluginFn, PluginC, PluginLoadError, PluginType, RustPluginFn, PluginTopologicalConfig, PluginOrderedConfig, Plugin, PluginManager,
+    warn, CPluginFn, Plugin, PluginC, PluginLoadError, PluginManager, PluginOrderedConfig, PluginTopologicalConfig, PluginType, RustPluginFn
 };
 
 use crate::UnixContext;
@@ -63,7 +63,7 @@ impl PluginLoader {
         Ok(library)
     }
 
-    pub fn try_load_plugin(plugin_name: &str, ctx: &mut UnixContext) -> Result<PluginType<UnixContext, Library>, PluginLoadError> {
+    pub fn try_load_plugin(plugin_name: &str, ctx: Arc<UnixContext>) -> Result<PluginType<UnixContext, Library>, PluginLoadError> {
         let match_symbols = [
             "register_rust_plugin",
             "register_c_plugin",
@@ -71,7 +71,7 @@ impl PluginLoader {
 
         for symbol_name in match_symbols {
             // Пробуем загрузить как Rust плагин
-            match Self::try_load_rust_plugin(plugin_name, symbol_name, ctx) {
+            match Self::try_load_rust_plugin(plugin_name, symbol_name, ctx.clone()) {
                 Ok(plugin) => return Ok(plugin),
                 Err(PluginLoadError::SymbolNotFound { .. }) => {
                     // Символ не найден, пробуем следующий метод или символ
@@ -80,7 +80,7 @@ impl PluginLoader {
             }
             
             // Пробуем загрузить как C плагин
-            match Self::try_load_c_plugin(plugin_name, symbol_name, ctx) {
+            match Self::try_load_c_plugin(plugin_name, symbol_name, ctx.clone()) {
                 Ok(plugin) => return Ok(plugin),
                 Err(PluginLoadError::SymbolNotFound { .. }) => {
                     // Символ не найден, пробуем следующий символ
@@ -106,7 +106,7 @@ impl PluginLoader {
     pub fn try_load_c_plugin(
         plugin_name: &str,
         symbol_name: &str,
-        ctx: &mut UnixContext,
+        ctx: Arc<UnixContext>,
     ) -> Result<PluginType<UnixContext, Library>, PluginLoadError> {
         let library = match Self::try_load_library(plugin_name) {
             Ok(lib) => lib,
@@ -131,7 +131,7 @@ impl PluginLoader {
                         error: e.to_string(),
                     },
                 });
-
+    
             match res {
                 Ok(f) => f,
                 Err(e) => return Err(PluginLoadError::SymbolLoadError {
@@ -141,9 +141,14 @@ impl PluginLoader {
                 }),
             }
         };
-
-        let plugin = new(ctx);
-
+    
+        // Для C-плагинов нужно преобразовать Arc<UnixContext> в *mut UnixContext
+        let ctx_ptr = Arc::into_raw(ctx.clone()) as *mut _;
+        let plugin = new(ctx_ptr);
+        
+        // Восстанавливаем Arc, чтобы не утекла память
+        let _ = unsafe { Arc::from_raw(ctx_ptr) };
+    
         if plugin.is_null() {
             return Err(PluginLoadError::PluginInitFailed {
                 library_name: plugin_name.to_owned(),
@@ -151,16 +156,16 @@ impl PluginLoader {
                 error: "Plugin init failed. null ptr received".to_string(),
             });
         }
-
+    
         let plugin = unsafe {
-            PluginC::from_raw(plugin)
+            PluginC::from_raw(plugin, ctx)
         };
-
+    
         let plugin = PluginType::C {
             lib: library,
             plugin: plugin,
         };
-
+    
         Ok(plugin)
     }
 
@@ -175,13 +180,13 @@ impl PluginLoader {
     pub fn try_load_rust_plugin(
         plugin_name: &str,
         symbol_name: &str,
-        ctx: &mut UnixContext,
+        ctx: Arc<UnixContext>,
     ) -> Result<PluginType<UnixContext, Library>, PluginLoadError> {
         let library = match Self::try_load_library(plugin_name) {
             Ok(lib) => lib,
             Err(e) => return Err(e),
         };
-
+    
         let new: Symbol<RustPluginFn<UnixContext>> = unsafe {
             let res = library
                 .get(symbol_name.as_bytes())
@@ -200,7 +205,7 @@ impl PluginLoader {
                         error: e.to_string(),
                     },
                 });
-
+    
             match res {
                 Ok(f) => f,
                 Err(e) => return Err(PluginLoadError::SymbolLoadError {
@@ -210,7 +215,7 @@ impl PluginLoader {
                 }),
             }
         };
-
+    
         match new(ctx) {
             Err(e) => return Err(PluginLoadError::PluginInitFailed {
                 library_name: plugin_name.to_owned(),
@@ -223,7 +228,7 @@ impl PluginLoader {
             }),
         }
     }
-
+    
     pub fn load_topological_plugin_config(path: &str) -> Result<Vec<PluginTopologicalConfig>, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
         let value: Value = content.parse()?;
@@ -350,6 +355,10 @@ impl PluginLoader {
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
                             
+                            let system = fields.get("system")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            
                             i = order + 1;
                             
                             // Получаем хеш-сумму или время модификации файла
@@ -357,7 +366,7 @@ impl PluginLoader {
     
                             plugin_configs.push(PluginOrderedConfig {
                                 enable,
-                                system: false,
+                                system,
                                 name: plugin_name.clone(),
                                 path,
                                 order,
@@ -469,14 +478,14 @@ impl PluginLoader {
     // Метод для применения изменений конфигурации
     pub fn apply_config_changes(
         plugin_manager: &mut PluginManager<UnixContext, Library>,
-        ctx: &mut UnixContext,
+        ctx: Arc<UnixContext>,
         changes: Vec<PluginConfigChange>,
     ) -> Result<(), PluginLoadError> {
         for change in changes {
             match change {
                 PluginConfigChange::Add(config) => {
                     // Загружаем новый плагин
-                    match Self::try_load_plugin(&config.path, ctx) {
+                    match Self::try_load_plugin(&config.path, ctx.clone()) {
                         Ok(plugin_type) => {
                             plugin_manager.get_plugins().push(abstractions::Plugin {
                                 config: config.clone(),
@@ -502,25 +511,11 @@ impl PluginLoader {
                 PluginConfigChange::Reload(config) => {
                     // Находим и удаляем старый плагин
                     if let Some(idx) = plugin_manager.get_plugins().iter().position(|p| p.config.name == config.name) {
-                        // забераем плагин из списка
-                        let plugin = plugin_manager.get_plugins().remove(idx);
-                        // Вызываем free для плагина перед удалением
-                        if let abstractions::PluginStatus::Enable(plugin_type) = plugin.status {
-                            match plugin_type {
-                                abstractions::PluginType::Rust {mut plugin, .. } => {
-                                    plugin.free(ctx);
-                                },
-                                abstractions::PluginType::C { plugin, .. } => {
-                                    unsafe {
-                                        (plugin.free)(plugin.get_raw(), ctx);
-                                    }
-                                }
-                            }
-                        }
+                        let _ = plugin_manager.get_plugins().remove(idx);
                     }
                     
                     // Загружаем плагин заново
-                    match Self::try_load_plugin(&config.path, ctx) {
+                    match Self::try_load_plugin(&config.path, ctx.clone()) {
                         Ok(plugin_type) => {
                             plugin_manager.get_plugins().push(abstractions::Plugin {
                                 config: config,
@@ -547,19 +542,8 @@ impl PluginLoader {
                     // Находим и удаляем плагин
                     if let Some(idx) = plugin_manager.get_plugins().iter().position(|p| p.config.name == name) {
                         let plugin = plugin_manager.get_plugins().remove(idx);
-                        // Вызываем free для плагина перед удалением
-                        if let abstractions::PluginStatus::Enable(plugin_type) = plugin.status {
-                            match plugin_type {
-                                abstractions::PluginType::Rust {mut plugin, .. } => {
-                                    plugin.free(ctx);
-                                },
-                                abstractions::PluginType::C { plugin, .. } => {
-                                    unsafe {
-                                        (plugin.free)(plugin.get_raw(), ctx);
-                                    }
-                                }
-                            }
-                        }
+                        // Забываем о плагине, чтобы не вызывать его деструктор
+                        std::mem::forget(plugin);
                     }
                 },
                 PluginConfigChange::Disable(name) => {
